@@ -13,7 +13,7 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
-from .activity import thread_activity
+from .activity import thread_activity, verify_cli_protocol
 from .maintenance import DatabaseMaintenance
 
 Path = pathlib.Path
@@ -108,8 +108,9 @@ def classify(row, children=()):
     return 'unknown'
 
 
-def run_cli(args, home, timeout=12):
-    env = os.environ.copy()
+def run_cli(args, home, timeout=12, isolated=False):
+    env = {key: value for key, value in os.environ.items()
+           if not isolated or not key.upper().startswith('CODEX_')}
     env['CODEX_HOME'] = str(home)
     return subprocess.run(args, env=env, stdin=subprocess.DEVNULL, capture_output=True,
                           encoding='utf-8', errors='replace', timeout=timeout,
@@ -125,6 +126,7 @@ def detect_cli(home, explicit=''):
             candidates.extend(str(p) for p in sorted(base.glob('*/codex.exe'),
                                                     key=lambda p: p.stat().st_mtime, reverse=True))
     errors = []
+    incompatible = None
     for candidate in dict.fromkeys(candidates):
         if not candidate:
             continue
@@ -136,11 +138,21 @@ def detect_cli(home, explicit=''):
             h = run_cli([str(p), 'delete', '--help'], home)
             ok = v.returncode == h.returncode == 0 and 'codex-cli' in v.stdout and '--force' in h.stdout and 'UUID' in h.stdout
             if ok:
-                return {'path': str(p), 'version': v.stdout.strip(), 'available': True, 'message': '官方 delete --force 能力可用'}
+                verification = verify_cli_protocol(str(p), v.stdout.strip(),
+                    lambda args, temporary_home: run_cli(args, temporary_home, isolated=True))
+                result = {'path': str(p), 'version': v.stdout.strip(),
+                          'available': verification['verified'], 'lock_verified': verification['verified'],
+                          'message': verification['message']}
+                if result['available']:
+                    return result
+                incompatible = incompatible or result
+                continue
             errors.append(str(p) + ': 版本或 delete --force 能力验证失败')
         except (OSError, subprocess.TimeoutExpired) as e:
             errors.append(str(e))
-    return {'path': explicit, 'version': '', 'available': False,
+    if incompatible:
+        return incompatible
+    return {'path': explicit, 'version': '', 'available': False, 'lock_verified': False,
             'message': '只读：未找到可用 CLI。请指定桌面版 codex.exe，或加入 PATH。' + '；'.join(errors)}
 
 
@@ -150,7 +162,7 @@ class Store:
     def __init__(self, home, cli='', guard=None, runner=run_cli):
         self.home = Path(home).expanduser().resolve()
         self.cli_override = cli
-        self.cli = {'available': False, 'message': '正在检测 CLI', 'path': '', 'version': ''}
+        self.cli = {'available': False, 'lock_verified': False, 'message': '正在检测 CLI', 'path': '', 'version': ''}
         self.guard, self.runner = guard, runner
         self.lock = threading.RLock()
         self.operation = threading.Lock()
@@ -267,6 +279,7 @@ class Store:
                 self.diagnostics = []
                 self.generation += 1
             if detect:
+                self.cli = {'available': False, 'lock_verified': False, 'message': '正在检测 CLI', 'path': '', 'version': ''}
                 self.cli = detect_cli(self.home, self.cli_override)
             refs = defaultdict(set)
             for sid, row in rows.items():
@@ -456,7 +469,7 @@ class Store:
         if self.guard is not None:
             reason = self.guard()
             return {'code': 'unknown' if reason else 'idle', 'label': '状态未确认' if reason else '未占用', 'reason': reason}
-        return thread_activity(self.home, sid, self.cli.get('version', ''))
+        return thread_activity(self.home, sid, self.cli.get('lock_verified', False))
 
     def expand_ids(self, roots, include_missing=False):
         result = []

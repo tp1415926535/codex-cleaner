@@ -15,6 +15,7 @@ import sqlite3
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cleaner.activity import probe_file
+from cleaner.core import detect_cli
 
 
 def main():
@@ -22,6 +23,8 @@ def main():
     assert cli, 'CLI missing'
     with tempfile.TemporaryDirectory(prefix='cleaner-online-contract-') as td:
         home = Path(td).resolve()
+        detected = detect_cli(home, cli)
+        assert detected['available'] and detected['lock_verified'], detected
         env = os.environ.copy()
         env['CODEX_HOME'] = str(home)
         for name in ('CODEX_THREAD_ID', 'CODEX_SESSION_ID'):
@@ -31,7 +34,7 @@ def main():
         path.parent.mkdir()
         path.write_text(json.dumps({'timestamp':'2026-09-16T00:00:00Z','type':'session_meta','payload':{
             'id':sid,'timestamp':'2026-09-16T00:00:00Z','cwd':str(home),'originator':'codex_cli_rs',
-            'cli_version':'0.154.0-alpha.6.2','source':'cli','model_provider':'openai'}})+'\n', encoding='utf-8')
+            'cli_version':detected['version'].removeprefix('codex-cli '),'source':'cli','model_provider':'openai'}})+'\n', encoding='utf-8')
         locks = home / 'thread-writer-locks'
         locks.mkdir()
         lock = locks / f'{sid}.lock'
@@ -64,7 +67,8 @@ def main():
         try: remaining = conn.execute('SELECT count(*) FROM threads WHERE id=?',(orphan,)).fetchone()[0]
         finally: conn.close()
         assert cleaned.returncode == 0 and remaining == 0 and not missing.exists(), (cleaned.stdout,cleaned.stderr,remaining)
-        print(json.dumps({'locked_delete':'refused, rollout intact','unlocked_delete':'success, rollout removed',
+        print(json.dumps({'cli_version':detected['version'],'automatic_lock_verification':'passed',
+                          'locked_delete':'refused, rollout intact','unlocked_delete':'success, rollout removed',
                           'missing_rollout':'orphan metadata removed successfully',
                           'read_only_probe':'busy/free matches CLI','home':'isolated temporary directory'},ensure_ascii=False))
 

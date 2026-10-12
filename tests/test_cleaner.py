@@ -14,7 +14,7 @@ from contextlib import contextmanager
 
 from app import make_server
 from cleaner.core import Store, PAGE_BYTES, canonical, classify, detect_cli, user_text, run_cli
-from cleaner.activity import VERIFIED_VERSION, thread_activity, probe_file
+from cleaner.activity import thread_activity, probe_file
 
 
 @contextmanager
@@ -106,7 +106,7 @@ class Fixture(unittest.TestCase):
         self.store.diagnostics.append({'owner': missing})
         self.assertFalse(self.store.plan([parent])['allowed'])
 
-    def test_delete_recheck_preserves_verified_cli_version(self):
+    def test_delete_recheck_preserves_protocol_verification(self):
         parent, _ = self.row()
         missing = str(uuid.uuid4())
         with fixture_db(self.db) as c:
@@ -114,9 +114,9 @@ class Fixture(unittest.TestCase):
             c.execute('INSERT INTO thread_spawn_edges VALUES(?,?)', (parent, missing))
         self.scan()
         self.store.guard = None
-        self.store.cli['version'] = VERIFIED_VERSION
-        def activity(home, sid, version):
-            self.assertEqual(version, VERIFIED_VERSION)
+        self.store.cli['lock_verified'] = True
+        def activity(home, sid, protocol_verified):
+            self.assertIs(protocol_verified, True)
             return {'code': 'idle', 'label': '未占用', 'reason': ''}
         self.store.runner = lambda *args, **kwargs: subprocess.CompletedProcess([], 1, '', 'fixture failure')
         with patch('cleaner.core.thread_activity', side_effect=activity):
@@ -389,7 +389,8 @@ class Fixture(unittest.TestCase):
         b, _ = self.row()
         self.scan()
         self.store.guard = None
-        self.store.cli['version'] = VERIFIED_VERSION
+        self.store.cli['version'] = 'codex-cli future-version'
+        self.store.cli['lock_verified'] = True
         locks = self.home / 'thread-writer-locks'
         locks.mkdir()
         (locks / '.coordination.lock').touch()
@@ -408,7 +409,7 @@ class Fixture(unittest.TestCase):
         a, _ = self.row()
         self.scan()
         self.store.guard = None
-        self.store.cli['version'] = 'unknown-version'
+        self.store.cli['lock_verified'] = False
         self.assertFalse(self.store.plan([a])['allowed'])
 
     def test_target_becomes_busy_after_confirmation(self):

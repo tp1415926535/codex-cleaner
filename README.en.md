@@ -23,7 +23,7 @@ The service listens only on `127.0.0.1` and does not upload conversation content
 - Existing local Codex session data.
 - A compatible Codex CLI for session deletion. The tool attempts to find it automatically.
 
-**The current deletion compatibility baseline is `codex-cli 0.154.0-alpha.6.2`.** Session deletion is disabled when the locking protocol of another CLI version has not been verified. This does not mean your data is damaged. Python testing has primarily used Windows with Python 3.13.
+**No fixed CLI version is required.** The tool checks the official deletion command and automatically verifies its behavior in an isolated temporary data directory: a locked session must be protected, other sessions must remain deletable, and releasing the lock must allow deletion. Verification uses disposable test sessions and never touches your real sessions. Deletion is enabled after verification succeeds; failures appear at the top with a read-only status and reason. Python testing has primarily used Windows with Python 3.13.
 
 ## Quick start
 
@@ -139,7 +139,9 @@ These are findings such as missing files, read failures, unexpected paths, or un
 
 ### Why are some records blocked from deletion?
 
-A session may be in use by Codex, the CLI version may be incompatible, permissions may be insufficient, or file ownership may be uncertain. The deletion plan or execution result explains the specific reason. The tool does not bypass these checks to delete files directly.
+A session may be in use by Codex, CLI deletion capability or session lock verification may have failed, permissions may be insufficient, or file ownership may be uncertain. Check the CLI status at the top, connection details in Settings, the deletion plan, or the execution result for the specific reason. The tool does not bypass these checks to delete files directly.
+
+Session activity updates automatically about every 6 seconds; you do not need to quit Codex entirely. After updating the CLI, use **Recheck files** in **Scan issues**, or save Settings, to verify it again. Closing Codex does not resolve a verification failure.
 
 ### Does changing the language change my conversations?
 

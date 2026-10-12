@@ -17,7 +17,18 @@ function projectKey(r){
 const fmt = n => {n=Number(n)||0; let u=0; while(n>=1024&&u<4){n/=1024;u++;}return `${n.toFixed(u?2:0)} ${['B','KiB','MiB','GiB','TiB'][u]}`;};
 function element(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)uiText(e,text);if(cls)e.className=cls;return e;}
 function content(tag,text,cls){const e=element(tag,undefined,cls);rawText(e,text);return e;}
-function error(e){uiText($('error'),e.message||String(e));$('error').hidden=false;}
+const errorMessages=new Map();
+function renderError(){
+ const messages=[...errorMessages.values()];
+ uiText($('error'),messages.length?messages[messages.length-1]:'');
+ $('error').hidden=!messages.length;
+}
+function error(e,source='operation'){
+ errorMessages.delete(source);
+ errorMessages.set(source,e.message||String(e));
+ renderError();
+}
+function clearError(source){if(errorMessages.delete(source))renderError();}
 async function api(path,data){const r=await fetch(path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':token},body:JSON.stringify(data)});const v=await r.json();if(!r.ok)throw new Error(v.error||r.statusText);return v;}
 let sizeState=null,sizeRows=new Map(),sizeEdges={},sizeCache=new Map();
 function scopeSize(ids){
@@ -256,7 +267,15 @@ function updateLoading(failure=''){
  uiText($('scanProgress'),busy?(state?.status||'正在加载会话…'):'');
  document.querySelector('.tablewrap').setAttribute('aria-busy',String(busy));
 }
-async function poll(){try{const next=await api('/api/state');next.rows=next.rows.filter(r=>!deletedIds.has(r.id));token=next.csrf;const oldGen=state?.generation;const oldComplete=state?.complete;state=next;const ids=new Set(state.rows.map(r=>r.id));selected=new Set([...selected].filter(id=>ids.has(id)));uiText($('size'),fmt(state.rows.reduce((s,r)=>s+r.size,0)));uiText($('scanState'),state.status);I18N.attribute($('scanState'),'title',state.source);uiText($('cliState'),state.cli.available?'CLI 可用':'CLI 只读 / 检测中');I18N.attribute($('cliState'),'title',(state.cli.version||'')+'\n'+state.cli.message);if(state.error)error(state.error);const nextActivity=JSON.stringify(state.rows.map(r=>[r.state,r.issues]));if(oldGen!==state.generation||oldComplete!==state.complete||nextActivity!==activitySignature){activitySignature=nextActivity;const old=$('project').value;$('project').replaceChildren(element('option',msg('all_projects')));$('project').firstChild.value='';const groups=projectGroups(state.rows);for(const g of groups.sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'))){const duplicate=groups.some(other=>other.key!==g.key&&other.name===g.name);const o=content('option',g.name+(duplicate?' · '+([...g.paths][0]||g.key):''));o.value=g.key;$('project').append(o);}if([...$('project').options].some(o=>o.value===old))$('project').value=old;render();}else if(!state.complete)render();uiText($('openDiagnostics'),msg('diagnostic_count',{count:state.diagnostic_count}));renderDiagnostics();updateLoading();}catch(e){error(e);updateLoading(e.message);}finally{setTimeout(poll,state?.complete?6000:1500);}}
+function renderCliStatus(){
+ const cli=state.cli;
+ const checking=cli.message==='正在检测 CLI';
+ uiText($('cliState'),cli.available?msg('cli_verified'):checking?msg('checking_cli'):cli.version?msg('cli_verification_failed'):msg('cli_unavailable'));
+ I18N.attribute($('cliState'),'title',(cli.version||'')+'\n'+cli.message);
+ $('cliNotice').hidden=cli.available||checking;
+ uiText($('cliNotice'),cli.available||checking?'':cli.message);
+}
+async function poll(){try{const next=await api('/api/state');next.rows=next.rows.filter(r=>!deletedIds.has(r.id));token=next.csrf;const oldGen=state?.generation;const oldComplete=state?.complete;state=next;const ids=new Set(state.rows.map(r=>r.id));selected=new Set([...selected].filter(id=>ids.has(id)));uiText($('size'),fmt(state.rows.reduce((s,r)=>s+r.size,0)));uiText($('scanState'),state.status);I18N.attribute($('scanState'),'title',state.source);renderCliStatus();if(state.error)error(state.error,'poll');else clearError('poll');const nextActivity=JSON.stringify(state.rows.map(r=>[r.state,r.issues]));if(oldGen!==state.generation||oldComplete!==state.complete||nextActivity!==activitySignature){activitySignature=nextActivity;const old=$('project').value;$('project').replaceChildren(element('option',msg('all_projects')));$('project').firstChild.value='';const groups=projectGroups(state.rows);for(const g of groups.sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'))){const duplicate=groups.some(other=>other.key!==g.key&&other.name===g.name);const o=content('option',g.name+(duplicate?' · '+([...g.paths][0]||g.key):''));o.value=g.key;$('project').append(o);}if([...$('project').options].some(o=>o.value===old))$('project').value=old;render();}else if(!state.complete)render();uiText($('openDiagnostics'),msg('diagnostic_count',{count:state.diagnostic_count}));renderDiagnostics();updateLoading();}catch(e){error(e,'poll');updateLoading(e.message);}finally{setTimeout(poll,state?.complete?6000:1500);}}
 async function loadPreview(id,append=false){const sequence=++previewSequence;focusId=id;$('previewId').hidden=false;uiText($('previewId'),'ID：'+id);$('clearPreview').disabled=false;if(!append){previewOffset=0;previewFile=0;$('messages').replaceChildren();rawText($('previewTitle'),state.rows.find(r=>r.id===id)?.title||id);} if(!append){const row=state.rows.find(r=>r.id===id);if(row?.kind==='internal'){const info=element('div',undefined,'record-info');info.append(element('b',row.record_type||'内部记录'),element('p',row.record_type==='操作安全审批'?'Codex 为工具操作生成的安全审批，下面展示审批输入和结果。':'Codex 派生的代理任务，下面展示任务输入和回复。'));for(const parent of row.parents||[]){const link=element('button',msg('parent_session',{title:parent.title}),'diagnostic-locate');link.onclick=()=>locateDiagnosticThread(state.rows.find(r=>r.id===parent.id));info.append(link);}info.append(element('p',msg('record_id',{id:row.id})),element('p',msg('source_value',{source:row.source})));$('messages').append(info);}}uiText($('previewMeta'),msg('reading_preview'));$('more').disabled=true;uiText($('more'),msg('loading'));try{while(true){const previousOffset=previewOffset,previousFile=previewFile;const p=await api(`/api/preview?id=${encodeURIComponent(id)}&offset=${previewOffset}&file=${previewFile}`);if(sequence!==previewSequence)return;for(const m of p.messages){const box=element('div',undefined,'message');box.append(element('b',m.label),content('pre',m.text));$('messages').append(box);}uiText($('previewMeta'),p.note);if(!p.messages.length&&!append&&p.next===null)$('messages').append(element('p',msg('no_displayable_messages')));previewOffset=p.next;previewFile=p.file_index||0;$('more').hidden=p.next===null;$('files').replaceChildren(...p.files.map(f=>element('div',msg(f.shared?'shared_file_detail':'file_detail',{path:f.path,size:fmt(f.size),evidence:f.evidence}),'file')));
 if(p.messages.length||p.next===null)break;
 if(previousOffset===previewOffset&&previousFile===previewFile)throw new Error('读取位置没有前进，请重试。');
