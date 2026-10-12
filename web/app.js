@@ -2,7 +2,16 @@
 const $ = id => document.getElementById(id);
 let activitySignature='', state, token='', selected=new Set(), recordScope='all', focusId='', previewOffset=0, previewFile=0, activePlan, previewSequence=0, deleting=false;
 let grouped=false,diagnosticPage=0;
-let databaseBusy=false;
+let databaseBusy=false,filesBusy=false;
+let selectionHome='';
+function saveSessionView(){
+ if(!selectionHome)return;
+ try{localStorage.setItem('cleaner.sessions:'+selectionHome,JSON.stringify({selected:[...selected],search:$('search').value,project:$('project').value,fileStatus:$('fileStatus').value,sort:$('sort').value}));}catch{}
+}
+function restoreSessionView(home){
+ if(selectionHome===home)return;selectionHome=home;selected=new Set();
+ try{const saved=JSON.parse(localStorage.getItem('cleaner.sessions:'+home)||'null');if(saved){selected=new Set(saved.selected||[]);for(const id of ['search','fileStatus','sort'])if(typeof saved[id]==='string')$(id).value=saved[id];$('project').dataset.restore=saved.project||'';}}catch{}
+}
 const deletedIds=new Set();
 const diagnosticLabels={missing:'文件缺失',unreadable:'无法读取',unsafe:'路径越界',orphan:'归属不明'};
 const collapsedProjects=new Set();
@@ -48,7 +57,7 @@ function selectionTotals(){
  return {own,related,count,relatedCount};
 }
 function sizeSummary(own,related,relatedCount,count){return relatedCount?msg('selection_with_children',{own:fmt(own),children:fmt(related),count:relatedCount,total:count,size:fmt(own+related)}):msg('selection_size',{count,size:fmt(own)});}
-function selection(){const totals=selectionTotals();uiText($('selection'),totals.count?sizeSummary(totals.own,totals.related,totals.relatedCount,totals.count):'未选择会话');$('plan').disabled=!totals.count||!state?.complete||deleting||databaseBusy;const visible=filtered();$('selectAll').checked=visible.length>0&&visible.every(r=>selected.has(r.id));$('selectAll').indeterminate=visible.some(r=>selected.has(r.id))&&!$('selectAll').checked;}
+function selection(){saveSessionView();const totals=selectionTotals();uiText($('selection'),totals.count?sizeSummary(totals.own,totals.related,totals.relatedCount,totals.count):'未选择会话');$('plan').disabled=!totals.count||!state?.complete||deleting||databaseBusy||filesBusy;const visible=filtered();$('selectAll').checked=visible.length>0&&visible.every(r=>selected.has(r.id));$('selectAll').indeterminate=visible.some(r=>selected.has(r.id))&&!$('selectAll').checked;}
 
 function problemCell(r){
   const cell=element('td',undefined,'problem-cell');const notes=new Map();
@@ -275,7 +284,7 @@ function renderCliStatus(){
  $('cliNotice').hidden=cli.available||checking;
  uiText($('cliNotice'),cli.available||checking?'':cli.message);
 }
-async function poll(){try{const next=await api('/api/state');next.rows=next.rows.filter(r=>!deletedIds.has(r.id));token=next.csrf;const oldGen=state?.generation;const oldComplete=state?.complete;state=next;const ids=new Set(state.rows.map(r=>r.id));selected=new Set([...selected].filter(id=>ids.has(id)));uiText($('size'),fmt(state.rows.reduce((s,r)=>s+r.size,0)));uiText($('scanState'),state.status);I18N.attribute($('scanState'),'title',state.source);renderCliStatus();if(state.error)error(state.error,'poll');else clearError('poll');const nextActivity=JSON.stringify(state.rows.map(r=>[r.state,r.issues]));if(oldGen!==state.generation||oldComplete!==state.complete||nextActivity!==activitySignature){activitySignature=nextActivity;const old=$('project').value;$('project').replaceChildren(element('option',msg('all_projects')));$('project').firstChild.value='';const groups=projectGroups(state.rows);for(const g of groups.sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'))){const duplicate=groups.some(other=>other.key!==g.key&&other.name===g.name);const o=content('option',g.name+(duplicate?' · '+([...g.paths][0]||g.key):''));o.value=g.key;$('project').append(o);}if([...$('project').options].some(o=>o.value===old))$('project').value=old;render();}else if(!state.complete)render();uiText($('openDiagnostics'),msg('diagnostic_count',{count:state.diagnostic_count}));renderDiagnostics();updateLoading();}catch(e){error(e,'poll');updateLoading(e.message);}finally{setTimeout(poll,state?.complete?6000:1500);}}
+async function poll(){try{const next=await api('/api/state');next.rows=next.rows.filter(r=>!deletedIds.has(r.id));token=next.csrf;const oldGen=state?.generation;const oldComplete=state?.complete;state=next;restoreSessionView(state.home);const ids=new Set(state.rows.map(r=>r.id));if(state.complete){selected=new Set([...selected].filter(id=>ids.has(id)));saveSessionView();}uiText($('size'),fmt(state.rows.reduce((s,r)=>s+r.size,0)));uiText($('scanState'),state.status);I18N.attribute($('scanState'),'title',state.source);renderCliStatus();if(state.error)error(state.error,'poll');else clearError('poll');const nextActivity=JSON.stringify(state.rows.map(r=>[r.state,r.issues]));if(oldGen!==state.generation||oldComplete!==state.complete||nextActivity!==activitySignature){activitySignature=nextActivity;const old=$('project').dataset.restore||$('project').value;delete $('project').dataset.restore;$('project').replaceChildren(element('option',msg('all_projects')));$('project').firstChild.value='';const groups=projectGroups(state.rows);for(const g of groups.sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'))){const duplicate=groups.some(other=>other.key!==g.key&&other.name===g.name);const o=content('option',g.name+(duplicate?' · '+([...g.paths][0]||g.key):''));o.value=g.key;$('project').append(o);}if([...$('project').options].some(o=>o.value===old))$('project').value=old;render();}else if(!state.complete)render();uiText($('openDiagnostics'),msg('diagnostic_count',{count:state.diagnostic_count}));renderDiagnostics();updateLoading();window.dispatchEvent(new Event('cleaner-state-change'));}catch(e){error(e,'poll');updateLoading(e.message);}finally{setTimeout(poll,state?.complete?6000:1500);}}
 async function loadPreview(id,append=false){const sequence=++previewSequence;focusId=id;$('previewId').hidden=false;uiText($('previewId'),'ID：'+id);$('clearPreview').disabled=false;if(!append){previewOffset=0;previewFile=0;$('messages').replaceChildren();rawText($('previewTitle'),state.rows.find(r=>r.id===id)?.title||id);} if(!append){const row=state.rows.find(r=>r.id===id);if(row?.kind==='internal'){const info=element('div',undefined,'record-info');info.append(element('b',row.record_type||'内部记录'),element('p',row.record_type==='操作安全审批'?'Codex 为工具操作生成的安全审批，下面展示审批输入和结果。':'Codex 派生的代理任务，下面展示任务输入和回复。'));for(const parent of row.parents||[]){const link=element('button',msg('parent_session',{title:parent.title}),'diagnostic-locate');link.onclick=()=>locateDiagnosticThread(state.rows.find(r=>r.id===parent.id));info.append(link);}info.append(element('p',msg('record_id',{id:row.id})),element('p',msg('source_value',{source:row.source})));$('messages').append(info);}}uiText($('previewMeta'),msg('reading_preview'));$('more').disabled=true;uiText($('more'),msg('loading'));try{while(true){const previousOffset=previewOffset,previousFile=previewFile;const p=await api(`/api/preview?id=${encodeURIComponent(id)}&offset=${previewOffset}&file=${previewFile}`);if(sequence!==previewSequence)return;for(const m of p.messages){const box=element('div',undefined,'message');box.append(element('b',m.label),content('pre',m.text));$('messages').append(box);}uiText($('previewMeta'),p.note);if(!p.messages.length&&!append&&p.next===null)$('messages').append(element('p',msg('no_displayable_messages')));previewOffset=p.next;previewFile=p.file_index||0;$('more').hidden=p.next===null;$('files').replaceChildren(...p.files.map(f=>element('div',msg(f.shared?'shared_file_detail':'file_detail',{path:f.path,size:fmt(f.size),evidence:f.evidence}),'file')));
 if(p.messages.length||p.next===null)break;
 if(previousOffset===previewOffset&&previousFile===previewFile)throw new Error('读取位置没有前进，请重试。');
@@ -304,7 +313,8 @@ $('closeProblems').onclick=()=>$('problemDialog').close();
 $('retryPlan').onclick=()=>{$('planDialog').close();$('plan').click();};
 $('closePlan').onclick=()=>{if(!deleting)$('planDialog').close();};
 $('planDialog').addEventListener('cancel',e=>{if(deleting)e.preventDefault();});
-window.addEventListener('beforeunload',e=>{if(deleting||databaseBusy){e.preventDefault();e.returnValue='';}});
+window.addEventListener('pagehide',saveSessionView);
+window.addEventListener('beforeunload',e=>{if(deleting||databaseBusy||filesBusy){e.preventDefault();e.returnValue='';}});
 let progressTimer,localDelete=false,observedDelete=false,completionHandled=false,completedStarted=0,currentStarted=0;
 function finishDelete(result, failure=''){
  if(completionHandled)return;

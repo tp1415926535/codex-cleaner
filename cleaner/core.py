@@ -15,6 +15,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from .activity import thread_activity, verify_cli_protocol
 from .maintenance import DatabaseMaintenance
+from .files import FileCleanup
 
 Path = pathlib.Path
 HEADER_LIMIT = 256 * 1024
@@ -184,6 +185,7 @@ class Store:
         self.edges = {}
         self.activity_checked_at = 0
         self.databases = DatabaseMaintenance(self)
+        self.files = FileCleanup(self)
         self.delete_result = None
         self.delete_progress = {"running": False, "phase": "idle", "can_stop": True, "done": 0, "total": 0}
 

@@ -29,15 +29,36 @@ def make_server(store, port=8765):
 
         def reply(self, data, status=200, mime='application/json; charset=utf-8'):
             raw = json.dumps(data, ensure_ascii=False).encode('utf-8') if isinstance(data, (dict, list)) else data
+            self.reply_headers(status, mime, len(raw))
+            self.wfile.write(raw)
+
+        def reply_headers(self, status, mime, length=None):
             self.send_response(status)
             self.send_header('Content-Type', mime)
-            self.send_header('Content-Length', str(len(raw)))
+            if length is not None: self.send_header('Content-Length', str(length))
+            else:
+                self.send_header('Connection', 'close')
+                self.close_connection = True
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
             self.end_headers()
-            self.wfile.write(raw)
+
+        def stream_files(self, days):
+            self.reply_headers(200, 'application/x-ndjson; charset=utf-8')
+            iterator = store.files.iter_inspect(days)
+            try:
+                for report in iterator:
+                    self.wfile.write((json.dumps(report, ensure_ascii=False) + '\n').encode('utf-8'))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError): pass
+            except Exception as error:
+                try:
+                    self.wfile.write((json.dumps({'error': str(error)}, ensure_ascii=False) + '\n').encode('utf-8'))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError): pass
+            finally: iterator.close()
 
         def valid_host(self):
             return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
@@ -49,6 +70,22 @@ def make_server(store, port=8765):
                 return self.reply({'error': 'Origin 校验失败'}, 403)
             path = urlsplit(self.path)
             try:
+                if path.path in ('/api/files-preview', '/api/files-image'):
+                    q = parse_qs(path.query)
+                    token, relative = q.get('token', [''])[0], q.get('path', [''])[0]
+                    if path.path == '/api/files-preview': return self.reply(store.files.preview(token, relative))
+                    raw, mime = store.files.image(token, relative)
+                    return self.reply(raw, mime=mime)
+                if path.path == '/api/files-list':
+                    q = parse_qs(path.query)
+                    return self.reply(store.files.list_files(q.get('id', [''])[0], int(q.get('days', ['7'])[0]),
+                                      int(q.get('offset', ['0'])[0]), q.get('q', [''])[0], q.get('snapshot', [''])[0]))
+                if path.path == '/api/files-inspect':
+                    q = parse_qs(path.query)
+                    days = int(q.get('days', ['7'])[0])
+                    if q.get('stream', [''])[0] == '1': return self.stream_files(days)
+                    return self.reply(store.files.inspect(days))
+                if path.path == '/api/files-progress': return self.reply(store.files.progress)
                 if path.path == '/api/database-inspect': return self.reply(store.databases.inspect())
                 if path.path == '/api/database-progress': return self.reply(store.databases.progress)
                 if path.path == '/api/delete-progress':
@@ -58,7 +95,7 @@ def make_server(store, port=8765):
                 if path.path == '/api/preview':
                     q = parse_qs(path.query)
                     return self.reply(store.preview(q.get('id', [''])[0], int(q.get('offset', ['0'])[0]), int(q.get('file', ['0'])[0])))
-                assets = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'), '/i18n.js': ('i18n.js', 'text/javascript'), '/database.js': ('database.js', 'text/javascript'), '/locales/zh-CN.json': ('locales/zh-CN.json', 'application/json'), '/locales/en.json': ('locales/en.json', 'application/json'), '/style.css': ('style.css', 'text/css')}
+                assets = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'), '/i18n.js': ('i18n.js', 'text/javascript'), '/database.js': ('database.js', 'text/javascript'), '/files.js': ('files.js', 'text/javascript'), '/tabs.js': ('tabs.js', 'text/javascript'), '/locales/zh-CN.json': ('locales/zh-CN.json', 'application/json'), '/locales/en.json': ('locales/en.json', 'application/json'), '/style.css': ('style.css', 'text/css')}
                 if path.path in assets:
                     file, mime = assets[path.path]
                     return self.reply((ROOT / 'web' / file).read_bytes(), mime=mime + '; charset=utf-8')
@@ -75,6 +112,14 @@ def make_server(store, port=8765):
                 if length < 0 or length > 32768: raise ValueError('请求过大')
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json': raise ValueError('仅支持 JSON 请求')
                 data = json.loads(self.rfile.read(length))
+                if self.path == '/api/files-reveal':
+                    return self.reply(store.files.reveal(data.get('id', ''), data.get('days', 7),
+                                                       data.get('token', ''), data.get('path', ''), data.get('snapshot', '')))
+                if self.path == '/api/files-plan': return self.reply(store.files.plan(data.get('ids'), data.get('days', 7)))
+                if self.path == '/api/files-start':
+                    if data.get('confirmed') is not True: raise ValueError('Confirmation required')
+                    return self.reply(store.files.start(data.get('token', '')))
+                if self.path == '/api/files-stop': return self.reply(store.files.cancel())
                 if self.path == '/api/database-plan': return self.reply(store.databases.plan(data.get('names'), data.get('log_days')))
                 if self.path == '/api/database-start':
                     if data.get('confirmed') is not True: raise ValueError('Confirmation required')
@@ -122,7 +167,7 @@ def make_server(store, port=8765):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Codex Session Cleaner · 本地会话管理')
+    p = argparse.ArgumentParser(description='Codex Cleaner · 会话、数据库与文件清理')
     p.add_argument('--home', default=os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
     p.add_argument('--cli', default=os.environ.get('CODEX_CLEANER_CLI', ''))
     p.add_argument('--port', type=int, default=8765)
@@ -145,7 +190,7 @@ def main():
     store = Store(args.home, args.cli)
     server = make_server(store, args.port)
     url = f'http://127.0.0.1:{server.server_port}'
-    print('Codex Session Cleaner: ' + url + f' (PID {os.getpid()})', flush=True)
+    print('Codex Cleaner: ' + url + f' (PID {os.getpid()})', flush=True)
     store.start_scan()
     if not args.no_browser: threading.Timer(.5, webbrowser.open, args=(url,)).start()
     try: server.serve_forever()

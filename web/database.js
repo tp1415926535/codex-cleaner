@@ -1,27 +1,35 @@
 'use strict';
 (()=>{
- let report=null,plan=null,observed=false,starting=false;
- const dialog=$('databaseDialog');
+ let report=null,plan=null,observed=false,starting=false,reportHome='',inspecting=false;
+ const dialog=$('databaseWorkspace');
  const description={'thread_history_1.sqlite':'db_history','logs_2.sqlite':'db_logs','state_5.sqlite':'db_state'};
  function showError(e){$('dbError').hidden=false;uiText($('dbError'),msg('db_error',{detail:e.message||String(e)}));}
  function invalidate(){plan=null;$('dbPlan').hidden=true;$('dbExecute').hidden=true;$('dbReview').hidden=false;}
+ function save(){if(!reportHome)return;try{localStorage.setItem('cleaner.database:'+reportHome,JSON.stringify({names:[...dialog.querySelectorAll('#dbTable input:checked')].map(input=>input.value),days:$('dbLogDays').value}));}catch{}}
  function controls(busy){
-  databaseBusy=busy;$('dbClose').disabled=busy;$('dbReview').disabled=busy||!report;
-  $('dbExecute').disabled=busy;$('dbLogDays').disabled=busy;$('dbStop').hidden=!busy;
-  for(const input of dialog.querySelectorAll('input[type=checkbox]'))input.disabled=busy||input.dataset.invalid==='true';
+  databaseBusy=busy;const unavailable=busy||filesBusy||deleting;
+  $('dbClose').disabled=unavailable;$('dbReview').disabled=unavailable||!report;
+  $('dbExecute').disabled=unavailable;$('dbLogDays').disabled=unavailable;$('dbStop').hidden=!busy;
+  for(const input of dialog.querySelectorAll('input[type=checkbox]'))input.disabled=unavailable||input.dataset.invalid==='true';
   if(state)selection();
  }
  async function inspect(){
+  if(!state?.home||inspecting)return;
+  inspecting=true;
+  const requestedHome=state.home;let saved=null;
+  try{saved=JSON.parse(localStorage.getItem('cleaner.database:'+requestedHome)||'null');}catch{}
   $('dbLoading').hidden=false;uiText($('dbLoading'),msg('db_loading'));$('dbError').hidden=true;report=null;controls(false);
   try{
-   report=await api('/api/database-inspect');$('dbTable').replaceChildren();
+   const next=await api('/api/database-inspect');if(state.home!==requestedHome)return;
+   report=next;reportHome=requestedHome;$('dbTable').replaceChildren();
+   $('dbLogDays').value=saved?.days||'';
    const table=element('table'),head=element('thead'),tr=element('tr');
    for(const key of ['db_choose','db_database','db_disk','db_free'])tr.append(element('th',msg(key)));
    head.append(tr);table.append(head);const body=element('tbody');
    for(const db of report.databases){
     const row=element('tr'),checkCell=element('td'),check=element('input');check.type='checkbox';check.value=db.name;
-    check.dataset.invalid=String(!db.exists||!!db.error);check.disabled=check.dataset.invalid==='true';check.checked=!check.disabled;
-    I18N.attribute(check,'aria-label',msg('db_select',{name:db.name}));check.onchange=invalidate;checkCell.append(check);
+    check.dataset.invalid=String(!db.exists||!!db.error);check.disabled=check.dataset.invalid==='true';check.checked=!check.disabled&&(!saved||saved.names.includes(db.name));
+    I18N.attribute(check,'aria-label',msg('db_select',{name:db.name}));check.onchange=()=>{invalidate();save();};checkCell.append(check);
     const name=element('td');name.append(content('b',db.name),element('small',msg(description[db.name]),'db-description'));
     row.append(checkCell,name,element('td',db.exists&&!db.error?fmt(db.bytes+db.wal_bytes):msg('db_unavailable')),element('td',db.free_bytes!==undefined?fmt(db.free_bytes):'—'));
     if(db.error)name.append(element('small',db.error,'db-description'));body.append(row);
@@ -30,12 +38,13 @@
    const history=report.databases.find(d=>d.name==='thread_history_1.sqlite');
    $('dbUnmatched').hidden=!history?.unmatched_sessions;
    if(history?.unmatched_sessions)uiText($('dbUnmatched'),msg('db_unmatched',{count:history.unmatched_sessions,records:history.unmatched_records?.thread_items||0}));
-  }catch(e){showError(e);}finally{$('dbLoading').hidden=true;controls(databaseBusy);}
+   save();
+  }catch(e){showError(e);}finally{inspecting=false;$('dbLoading').hidden=true;controls(databaseBusy);}
  }
- $('openDatabases').onclick=()=>{dialog.showModal();if(!databaseBusy){invalidate();$('dbResults').hidden=true;inspect();}};
- $('dbLogDays').onchange=invalidate;
- $('dbClose').onclick=()=>{if(!databaseBusy)dialog.close();};
- dialog.addEventListener('cancel',e=>{if(databaseBusy)e.preventDefault();});
+ window.addEventListener('cleaner-tab-change',event=>{if(event.detail==='database'&&!report&&!databaseBusy)inspect();});
+ if(activeTab==='database')inspect();
+ $('dbLogDays').onchange=()=>{invalidate();save();};
+ $('dbClose').onclick=()=>{if(!databaseBusy){invalidate();inspect();}};
  $('dbReview').onclick=async()=>{
   $('dbError').hidden=true;$('dbReview').disabled=true;
   try{
@@ -66,12 +75,16 @@
   try{const p=await api('/api/database-progress');
    if(p.running){
     observed=true;controls(true);
-    if(!dialog.open){$('settingsDialog').close();$('planDialog').close();dialog.showModal();}
     $('dbProgress').hidden=false;$('dbProgressBar').max=p.total||1;$('dbProgressBar').value=p.done;
     uiText($('dbProgressText'),msg('db_progress',{done:p.done,total:p.total,name:p.database,phase:msg(p.stopping?'db_stopping':'db_phase_'+p.phase)}));
     $('dbStop').disabled=!!p.stopping;
    }else if(observed&&!starting){observed=false;controls(false);$('dbProgress').hidden=true;invalidate();results(p);inspect();}
-  }catch{}finally{setTimeout(progress,1000);}
+  }catch{}finally{controls(databaseBusy);setTimeout(progress,1000);}
  }
+ window.addEventListener('cleaner-state-change',()=>{
+  if(reportHome&&reportHome!==state.home){report=null;reportHome='';invalidate();}
+  if(activeTab==='database'&&!report&&!databaseBusy)inspect();
+ });
+ window.addEventListener('pagehide',save);
  progress();
 })();

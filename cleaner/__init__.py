@@ -1,1 +1,1 @@
-"""Codex Session Cleaner: local, bounded, read-only discovery."""
+"""Codex Cleaner: local, bounded, read-only discovery."""

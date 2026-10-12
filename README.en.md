@@ -1,8 +1,8 @@
-# Codex Session Cleaner
+# Codex Cleaner
 
 [简体中文](README.md) | **English**
 
-A local Windows tool for managing and cleaning up Codex sessions. Use your browser to inspect storage usage, preview conversations, organize attached records, and delete sessions you no longer need.
+A local Windows cleanup tool for Codex, with session management, database maintenance, and file cleanup. Use your browser to inspect storage usage, preview contents, and remove unwanted sessions, old logs, caches, and staging leftovers.
 
 The service listens only on `127.0.0.1` and does not upload conversation content. Normal use requires no Node.js, frontend dependencies, or additional database installation.
 
@@ -14,7 +14,10 @@ The service listens only on `127.0.0.1` and does not upload conversation content
 - **Bulk cleanup**: Select individual records, all matching records, project groups, or groups of unlinked records.
 - **Missing-file cleanup**: Filter for records whose files are all missing and remove the remaining session records through the official CLI.
 - **Database maintenance**: Reclaim unused database space and optionally remove runtime logs according to a retention period.
+- **File cleanup**: Inspect the data directory, select recommended old logs, caches, and staging leftovers, and manually review generated artifacts and backups.
 - **Chinese / English**: The initial language follows your browser preference. Manual choices are remembered.
+
+Opening or refreshing the page always starts in **Sessions**. Selections, filters, and grouping preferences are still saved separately for each module.
 
 ## Requirements
 
@@ -126,6 +129,18 @@ Maintenance preserves existing sessions and history. It does not delete a histor
 Compaction requires temporary disk space. The tool reports database contention, insufficient space, or failed checks. Maintenance can be stopped, but committed log deletions are not rolled back. Maintenance, session deletion, and scanning cannot run concurrently.
 
 ## FAQ
+
+### How do I clean caches, temporary files, and generated outputs?
+
+Use the **File cleanup** tab. Directory and list placeholders appear immediately. Common cleanup directories are inspected first, and progress and completed directories stream into the page. Files can be previewed during inspection; recommendations and selection become available after all checks finish. The first inspection selects recommended items automatically; **Select recommended** reapplies the suggestions. The default retention is 7 days, with 30 and 90 days also available. Search paths, filter recommendations, and inspect the sizes of all top-level directories. Single files can be previewed directly. For directories containing multiple files, **View files** opens the complete searchable list, paginated at 100 files per page. Names are relative to the current directory. Images have thumbnails and an enlarged view; text files have content previews. **Open folder** is available on the main list, browser header, and selected file, opening the directory or selecting the file in Windows Explorer. Opening, searching, and paging reuse the inspected file inventory instead of rescanning the entire data directory. Single-file metadata appears immediately, while contents load independently in the preview pane. Deletion still revalidates the selection. Text previews read up to 256 KiB. PNG, JPEG, GIF, WebP, BMP, and ICO previews support images up to 16 MiB. HTML and SVG are shown as text. Both the file browser and enlarged image view have an upper-right × close icon and support Esc.
+
+The list groups items by top-level folder by default, with a separate group for files in the root. Group headers show item counts, file counts, and sizes. Multi-item groups can be collapsed; group checkboxes select only matching eligible items and exclude protected ones. Group and table-header checkboxes reflect all currently matching items; unselected protected items produce a partial-selection state. Switch to a flat list if preferred. Grouping and collapsed groups are saved with your selection. Summary statistics appear in a compact status bar. The directory sidebar shows the total size and file count of each top-level directory, with search and navigation that expands the target group. Directories without cleanup items show a retention notice. On mobile, navigation appears above the list.
+
+Recommendations cover old sandbox logs and command runners, selected tool caches, known staging directories, and failed atomic state writes. Current and recent runners, referenced paths, active tasks, links, unreadable items, and recent files are protected. Installed plugins, skills, authentication, rules, memories, and database files are retained.
+
+Visualizations, generated images, attachments, plans, and configuration backups require manual selection. Review the deletion plan and confirm permanent deletion. The selection is rechecked before execution; changes, usage, or permission problems prevent deletion. Remaining cleanup can be stopped, but deleted files cannot be recovered. Lock files and category roots remain; only empty selected task or staging directories are removed.
+
+The top navigation has **Sessions / Database maintenance / File cleanup**. Selections are saved per data directory and restored across tab changes and reloads. Session selections are reconciled only after a complete scan.
 
 ### Why can the deletion plan show a different size from the list?
 
