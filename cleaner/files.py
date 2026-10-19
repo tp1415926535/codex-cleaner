@@ -13,13 +13,40 @@ from bisect import bisect_left
 import threading
 import time
 import uuid
+from collections import deque
 
 from .activity import probe_file
+from .desktop import PREFIX, desktop_sources, desktop_running, resolve_desktop
+from .runtimes import audit_runtimes
 
 IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp', '.ico': 'image/x-icon'}
 TEXT_LIMIT = 256 * 1024
 IMAGE_LIMIT = 16 * 1024 * 1024
+DESKTOP_CHECK_INTERVAL = .1
+DESKTOP_CHECK_FILES = 32
+
+
+class _DesktopCacheGuard:
+    """Bound process enumeration by both elapsed time and file attempts."""
+    def __init__(self):
+        self.source = None
+        self.checked = 0
+        self.files = 0
+        self.state = False
+
+    def in_use(self, source):
+        # A running/unknown result remains protective for the rest of this job.
+        if self.state is not False: return True
+        now = time.monotonic()
+        if (source != self.source or now - self.checked >= DESKTOP_CHECK_INTERVAL
+                or self.files >= DESKTOP_CHECK_FILES):
+            self.state = desktop_running()
+            self.source = source
+            self.checked = time.monotonic()
+            self.files = 0
+        self.files += 1
+        return self.state is not False
 
 
 def preview_kind(name):
@@ -173,16 +200,32 @@ class FileCleanup:
                 if root.is_dir(follow_symlinks=False): folders.append({'name': root.name, 'bytes': 0, 'files': 0, 'issues': 0, 'pending': True})
             except OSError: pass
         by_name = {folder['name']: folder for folder in folders}
+        roots = [(root, home, '', root.name) for root in roots]
+        for key, source in desktop_sources(home).items():
+            for target in source['targets']:
+                path = source['root'] / target
+                try:
+                    with os.scandir(path.parent) as iterator:
+                        item = next((item for item in iterator if item.name == path.name), None)
+                    if item: roots.append((item, source['root'], PREFIX + key + '/', 'desktop-app'))
+                except OSError: pass
+        if any(prefix for _, _, prefix, _ in roots):
+            folder = {'name': 'desktop-app', 'bytes': 0, 'files': 0, 'issues': 0, 'pending': True}
+            folders.append(folder); by_name['desktop-app'] = folder
+        roots.sort(key=lambda item: (1 if item[2] else priority.get(item[0].name, 99), item[0].name.lower()))
+        remaining = {}
+        for _, _, _, group in roots: remaining[group] = remaining.get(group, 0) + 1
         scan = {'files': 0, 'bytes': 0, 'path': '', 'done': 0, 'total': len(roots)}
         last = time.monotonic()
         yield manifest, issues, folders, dict(scan), False
-        for root in roots:
+        for root, base, prefix, group in roots:
             size = count = failures = 0
+            before = dict(by_name.get(group, {}))
             stack = [root]
-            scan['path'] = root.name
+            scan['path'] = str(Path(root.path)) if prefix else root.name
             while stack:
                 item = stack.pop()
-                relative = Path(item.path).relative_to(home).as_posix()
+                relative = prefix + Path(item.path).relative_to(base).as_posix()
                 try:
                     info = item.stat(follow_symlinks=False)
                     if item.is_symlink() or getattr(info, 'st_file_attributes', 0) & 0x400:
@@ -201,16 +244,26 @@ class FileCleanup:
                 except OSError:
                     issues.add(relative); failures += 1
                 if time.monotonic() - last >= .2:
-                    if root.name in by_name: by_name[root.name].update(bytes=size, files=count, issues=failures)
+                    if group in by_name:
+                        by_name[group].update(bytes=before['bytes']+size, files=before['files']+count, issues=before['issues']+failures)
                     yield manifest, issues, folders, dict(scan), False
                     last = time.monotonic()
-            if root.name in by_name: by_name[root.name].update(bytes=size, files=count, issues=failures, pending=False)
+            remaining[group] -= 1
+            if group in by_name:
+                by_name[group].update(bytes=before['bytes']+size, files=before['files']+count,
+                                      issues=before['issues']+failures, pending=bool(remaining[group]))
             scan['done'] += 1
             yield manifest, issues, folders, dict(scan), True
 
     def _inventory(self, home):
         for manifest, issues, folders, _, _ in self._inventory_steps(home): pass
         return manifest, issues, folders
+
+    def _target(self, home, relative):
+        if relative.startswith(PREFIX):
+            source, actual = resolve_desktop(home, relative)
+            return source['root'], actual
+        return home, relative
 
     def _references(self, home):
         references = set()
@@ -253,7 +306,7 @@ class FileCleanup:
             except (OSError, ValueError): reliable = False
         return references, reliable
 
-    def _scan(self, days, inventory=None):
+    def _scan(self, days, inventory=None, runtime_checks=True, runtime_ids=None):
         if days not in (7, 30, 90): raise ValueError('Unsupported retention period')
         home = normal_path(self.store.home)
         manifest, issues, folders = self._inventory(home) if inventory is None else inventory
@@ -268,7 +321,7 @@ class FileCleanup:
             for lock in (home / 'thread-writer-locks').glob('*.lock'):
                 if probe_file(lock) in ('busy', 'unknown'): active.add(lock.stem)
         except OSError: pass
-        def add(relative, reason, recommend=False, retention=True, runtime=False):
+        def add(relative, reason, recommend=False, retention=True, runtime=False, source=None, blocked=''):
             if relative in manifest:
                 paths = {relative: manifest[relative]} if not relative.endswith('.lock') else {}
             else:
@@ -280,12 +333,14 @@ class FileCleanup:
                     if not name.endswith('.lock'): paths[name] = manifest[name]
                     index += 1
             if not paths: return
-            target = home / relative
+            base, actual = (source['root'], relative.split('/', 2)[2]) if source else (home, relative)
+            target = base / actual
             problem = ''
             if any(name == relative or name.startswith(relative + '/') for name in issues): problem = 'unsafe'
             elif any(target == ref or target in ref.parents or ref in target.parents for ref in references): problem = 'referenced'
             elif any(sid in Path(relative).parts for sid in active): problem = 'active'
             elif runtime: problem = 'current_runtime'
+            elif blocked: problem = blocked
             elif relative.startswith('.tmp/') and staging_busy: problem = 'active'
             elif reason in ('temporary', 'cache') and not reliable: problem = 'references_unknown'
             elif retention and max(stat[1] for stat in paths.values()) / 1e9 >= cutoff: problem = 'recent'
@@ -299,6 +354,9 @@ class FileCleanup:
                      'modified': max(stat[1] for stat in paths.values()) / 1e9,
                      'allowed': not problem, 'recommended': recommend and not problem,
                      'reason': problem or reason, 'samples': list(paths)[:6]}
+            if source:
+                entry.update(name=source['installation'] + '/' + actual, path=str(target), source='desktop',
+                             kind=source['kind'])
             entries.append(entry); members[relative] = paths
         # Logs and failed atomic state writes are disposable; config/state files are retained.
         for name in manifest:
@@ -336,6 +394,38 @@ class FileCleanup:
                 except ValueError: continue
                 artifacts.add('/'.join(parts[:index+1])); break
         for name in sorted(artifacts): add(name, 'artifact', retention=False)
+        sources = desktop_sources(home)
+        audit_sources = sources
+        if runtime_ids is not None:
+            selected = set(runtime_ids)
+            audit_sources = {key: {**source, 'targets': [target for target in source['targets']
+                             if PREFIX + key + '/' + target in selected]}
+                             for key, source in sources.items() if source['kind'] == 'runtime'}
+            audit_sources = {key: source for key, source in audit_sources.items() if source['targets']}
+        runtimes = audit_runtimes(home, audit_sources, self.store.cli) if runtime_checks else {}
+        cache_state = desktop_running() if any(source['kind'] == 'cache' for source in sources.values()) else False
+        for key, source in sources.items():
+            prefix = PREFIX + key + '/'
+            if source['kind'] == 'cache':
+                for target in source['targets']:
+                    add(prefix + target, 'desktop_cache', retention=False, source=source,
+                        blocked='desktop_running' if cache_state else 'desktop_unknown' if cache_state is None else '')
+            elif source['kind'] == 'runtime':
+                for target in source['targets']:
+                    check = runtimes.get((key, target), {'reason': 'runtime_unknown', 'checks': []})
+                    add(prefix + target, 'runtime_unused', source=source, blocked=check['reason'])
+                    if entries and entries[-1]['id'] == prefix + target:
+                        entries[-1]['checks'] = check['checks']
+            else:
+                logs = set()
+                for name in manifest:
+                    if not name.startswith(prefix + 'Logs/'): continue
+                    relative = name[len(prefix):]
+                    # Keep each day's rotations together, including all process/thread logs.
+                    match = re.match(r'Logs/\d{4}/\d{2}/\d{2}(?=/)', relative)
+                    logs.add(prefix + match[0] if match else name)
+                for name in sorted(logs):
+                    add(name, 'desktop_log', True, source=source)
         entries.sort(key=lambda entry: (not entry['recommended'], not entry['allowed'], -entry['bytes'], entry['id']))
         report = {'home': str(self.store.home.resolve()), 'days': days, 'entries': entries, 'directories': folders,
                   'bytes': sum(stat[0] for stat in manifest.values()), 'scanned_at': time.time()}
@@ -367,7 +457,7 @@ class FileCleanup:
                 if str(self.store.home.resolve()) != expected_home: raise ValueError('File changed; scan again')
                 changed = False
                 if finished_root and time.monotonic() - published >= .2:
-                    latest, members = self._scan(days, (manifest, issues, folders))
+                    latest, members = self._scan(days, (manifest, issues, folders), runtime_checks=False)
                     # Display partial results without treating incomplete checks as recommendations.
                     latest['entries'] = [{**entry, 'allowed': False, 'recommended': False, 'reason': 'scanning'}
                                          for entry in latest['entries']]
@@ -429,17 +519,18 @@ class FileCleanup:
             expected = session['files'].get(relative)
             if expected is None: raise ValueError('Unsafe cleanup path')
             home = normal_path(session['home'])
-        return home, expected
+        base, actual = self._target(home, relative)
+        return base, actual, expected
 
     def preview(self, token, relative):
-        home, expected = self._preview_target(token, relative)
+        home, actual, expected = self._preview_target(token, relative)
         kind = preview_kind(relative)
         result = {'path': relative, 'kind': kind, 'bytes': expected[0], 'modified': expected[1]/1e9}
         if kind == 'image':
             if expected[0] > IMAGE_LIMIT: return {**result, 'kind': 'unsupported', 'reason': 'image_limit'}
             return result
         if kind == 'unsupported': return result
-        raw = read_preview(home, relative, expected, TEXT_LIMIT)
+        raw = read_preview(home, actual, expected, TEXT_LIMIT)
         truncated = expected[0] > len(raw)
         encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
         try:
@@ -450,10 +541,10 @@ class FileCleanup:
         return {**result, 'text': text.replace('\r\n', '\n'), 'truncated': truncated}
 
     def image(self, token, relative):
-        home, expected = self._preview_target(token, relative)
+        home, actual, expected = self._preview_target(token, relative)
         if preview_kind(relative) != 'image' or expected[0] > IMAGE_LIMIT:
             raise ValueError('图片无法预览')
-        raw = read_preview(home, relative, expected, IMAGE_LIMIT)
+        raw = read_preview(home, actual, expected, IMAGE_LIMIT)
         valid = (raw.startswith(b'\x89PNG\r\n\x1a\n') or raw.startswith(b'\xff\xd8\xff') or
                  raw.startswith((b'GIF87a', b'GIF89a', b'BM', b'\x00\x00\x01\x00')) or
                  raw.startswith(b'RIFF') and raw[8:12] == b'WEBP')
@@ -462,15 +553,16 @@ class FileCleanup:
 
     def reveal(self, sid='', days=7, token='', relative='', snapshot=''):
         if relative:
-            home, expected = self._preview_target(token, relative)
-            path = safe_path(home, relative)
+            home, actual, expected = self._preview_target(token, relative)
+            path = safe_path(home, actual)
             if identity(path.stat()) != expected: raise ValueError('File changed; scan again')
         else:
             if not isinstance(sid, str): raise ValueError('Invalid file list request')
             home, members = self._listed_members(days, snapshot)
             if sid not in members: raise ValueError('Cleanup items changed or are protected; scan again')
             if home != str(self.store.home.resolve()): raise ValueError('File changed; scan again')
-            path = safe_path(normal_path(home), sid)
+            base, actual = self._target(normal_path(home), sid)
+            path = safe_path(base, actual)
         if os.name != 'nt': raise ValueError('打开文件夹仅支持 Windows')
         args = ['explorer.exe', str(path)] if path.is_dir() else ['explorer.exe', '/select,', str(path)]
         subprocess.Popen(args, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -481,7 +573,7 @@ class FileCleanup:
         if not isinstance(ids, list) or not ids or any(not isinstance(sid, str) for sid in ids):
             raise ValueError('Select valid cleanup items')
         with self.scan_lock:
-            report, members = self._scan(days)
+            report, members = self._scan(days, runtime_ids=ids)
         by_id = {entry['id']: entry for entry in report['entries']}
         ids = list(dict.fromkeys(ids))
         if any(sid not in by_id or not by_id[sid]['allowed'] for sid in ids):
@@ -502,7 +594,8 @@ class FileCleanup:
                 raise ValueError('Cleanup plan expired; check again')
             self.stop.clear()
             self.progress = {'running': True, 'done': 0, 'total': len(plan['manifest']), 'bytes': 0,
-                             'started': time.time(), 'results': [], 'error': ''}
+                             'success': 0, 'failed': 0, 'skipped': 0,
+                             'started': time.time(), 'phase': 'checking', 'results': [], 'error': ''}
             threading.Thread(target=self._run, args=(plan,), daemon=True).start()
             return {'ok': True}
         except Exception:
@@ -517,24 +610,64 @@ class FileCleanup:
         try:
             # Recheck the entire selection before deleting any file, including new references.
             with self.scan_lock:
-                report, members = self._scan(plan['days'])
+                report, members = self._scan(plan['days'], runtime_ids=plan['ids'])
             allowed = {entry['id'] for entry in report['entries'] if entry['allowed']}
             fresh = {name: stat for sid in plan['ids'] for name, stat in members.get(sid, {}).items()}
             if not set(plan['ids']).issubset(allowed) or fresh != plan['manifest']:
+                if any(entry['id'] in plan['ids'] and entry['reason'] in ('desktop_running', 'desktop_unknown')
+                       for entry in report['entries']):
+                    raise ValueError('请退出 Codex 桌面应用后重新检查浏览器缓存')
                 raise ValueError('Cleanup items changed or are protected; scan again')
             home = normal_path(plan['home'])
-            for relative, stat in plan['manifest'].items():
+            sources = desktop_sources(home)
+            cache_guard = _DesktopCacheGuard()
+            next_results_update = 0
+            self.progress = {**self.progress, 'phase': 'deleting'}
+            pending = deque(plan['manifest'].items())
+            while pending:
                 if self.stop.is_set(): break
+                relative, stat = pending.popleft()
+                actual_path = str(home / relative)
                 try:
-                    delete_file(home, relative, stat)
-                    result = {'path': relative, 'status': 'success', 'bytes': stat[0]}
+                    if relative.startswith(PREFIX):
+                        source, actual = resolve_desktop(home, relative, sources)
+                        base = source['root']
+                        actual_path = str(base / actual)
+                        if source['kind'] == 'cache' and cache_guard.in_use(base):
+                            # Stop touching this cache source immediately. Record one
+                            # skipped group instead of thousands of identical errors.
+                            prefix = '/'.join(relative.split('/')[:2]) + '/'
+                            remaining = deque((name, info) for name, info in pending if not name.startswith(prefix))
+                            count = 1 + len(pending) - len(remaining)
+                            pending = remaining
+                            result = {'path': str(base), 'actual_path': str(base), 'status': 'skipped',
+                                      'files': count, 'bytes': 0, 'reason': 'desktop_cache_in_use',
+                                      'error': 'Codex 桌面应用已启动或运行状态无法确认，剩余缓存已跳过；请退出桌面应用后重新检查。'}
+                            results.append(result)
+                            self.progress = {**self.progress, 'done': self.progress['done'] + count,
+                                             'skipped': self.progress['skipped'] + count, 'results': list(results)}
+                            continue
+                    else:
+                        base, actual = home, relative
+                    delete_file(base, actual, stat)
+                    result = {'path': relative, 'actual_path': actual_path, 'status': 'success', 'bytes': stat[0]}
                 except (OSError, ValueError) as error:
-                    result = {'path': relative, 'status': 'failed', 'bytes': 0, 'error': str(error)}
+                    result = {'path': relative, 'actual_path': actual_path, 'status': 'failed', 'bytes': 0, 'error': str(error)}
                 results.append(result)
-                self.progress = {**self.progress, 'done': len(results),
-                                 'bytes': self.progress['bytes'] + result['bytes'], 'results': list(results)}
+                now = time.monotonic()
+                # The UI polls once a second. Avoid copying a growing result list
+                # for every file; counters stay current and final results are exact.
+                published_results = self.progress['results']
+                if now >= next_results_update:
+                    published_results = list(results)
+                    next_results_update = now + .1
+                self.progress = {**self.progress, 'done': self.progress['done'] + 1,
+                                 result['status']: self.progress[result['status']] + 1,
+                                 'bytes': self.progress['bytes'] + result['bytes'], 'results': published_results}
             # Remove only now-empty task/staging directories; never recursively delete a directory.
             for relative in sorted(plan['ids'], key=len, reverse=True):
+                # Desktop profiles retain their directory structure for Chromium and log writers.
+                if relative.startswith(PREFIX): continue
                 try:
                     target = safe_path(home, relative)
                     if target.is_dir():

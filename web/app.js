@@ -9,7 +9,7 @@ function saveSessionView(){
  try{localStorage.setItem('cleaner.sessions:'+selectionHome,JSON.stringify({selected:[...selected],search:$('search').value,project:$('project').value,fileStatus:$('fileStatus').value,sort:$('sort').value}));}catch{}
 }
 function restoreSessionView(home){
- if(selectionHome===home)return;selectionHome=home;selected=new Set();
+ if(selectionHome===home)return;selectionHome=home;selected=new Set();sessionErrors.reset();
  try{const saved=JSON.parse(localStorage.getItem('cleaner.sessions:'+home)||'null');if(saved){selected=new Set(saved.selected||[]);for(const id of ['search','fileStatus','sort'])if(typeof saved[id]==='string')$(id).value=saved[id];$('project').dataset.restore=saved.project||'';}}catch{}
 }
 const deletedIds=new Set();
@@ -26,19 +26,19 @@ function projectKey(r){
 const fmt = n => {n=Number(n)||0; let u=0; while(n>=1024&&u<4){n/=1024;u++;}return `${n.toFixed(u?2:0)} ${['B','KiB','MiB','GiB','TiB'][u]}`;};
 function element(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)uiText(e,text);if(cls)e.className=cls;return e;}
 function content(tag,text,cls){const e=element(tag,undefined,cls);rawText(e,text);return e;}
-const errorMessages=new Map();
-function renderError(){
- const messages=[...errorMessages.values()];
- uiText($('error'),messages.length?messages[messages.length-1]:'');
- $('error').hidden=!messages.length;
+function createErrorReporter(node,format=value=>value){
+ const messages=new Map();
+ function render(){const values=[...messages.values()];uiText(node,values.length?format(values[values.length-1]):'');node.hidden=!values.length;}
+ return {
+  show(e,source){messages.delete(source);messages.set(source,e.message||String(e));render();},
+  clear(source){if(messages.delete(source))render();},
+  reset(){messages.clear();render();}
+ };
 }
-function error(e,source='operation'){
- errorMessages.delete(source);
- errorMessages.set(source,e.message||String(e));
- renderError();
-}
-function clearError(source){if(errorMessages.delete(source))renderError();}
-async function api(path,data){const r=await fetch(path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':token},body:JSON.stringify(data)});const v=await r.json();if(!r.ok)throw new Error(v.error||r.statusText);return v;}
+const sessionErrors=createErrorReporter($('error'));
+function error(e,source='operation'){sessionErrors.show(e,source);}
+function clearError(source){sessionErrors.clear(source);}
+async function api(path,data,options={}){const r=await fetch(path,{...options,...(data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':token},body:JSON.stringify(data)})});const v=await r.json();if(!r.ok)throw new Error(v.error||r.statusText);return v;}
 let sizeState=null,sizeRows=new Map(),sizeEdges={},sizeCache=new Map();
 function scopeSize(ids){
  if(sizeState!==state){sizeState=state;sizeRows=new Map((state?.rows||[]).map(r=>[r.id,r]));sizeEdges=state?.spawn_edges||{};sizeCache=new Map();}
@@ -103,6 +103,7 @@ function sessionRow(r,child=false,last=false){
   if(recordScope==='all')tr.classList.add('categorized-record');
   title.title=r.cwd+'\n'+r.id;
   const total=rowSize(r),bytes=element('td',fmt(total.size),'bytes');
+  if(r.compressed_file_count)bytes.append(element('small',msg('compressed_file_count',{count:r.compressed_file_count}),'size-breakdown'));
   if(total.count>1){bytes.append(element('small',msg('size_own_children',{size:fmt(r.size),count:total.count-1}),'size-breakdown'));I18N.attribute(bytes,'title',msg('size_tooltip',{total:fmt(total.size),own:fmt(r.size),children:fmt(total.size-r.size)}));}
   tr.append(title,bytes,element('td',r.updated_at?new Date(r.updated_at*1000).toLocaleDateString(I18N.language==='en'?'en-US':'zh-CN'):'未知'),problemCell(r));
   return tr;
@@ -134,6 +135,7 @@ function syncProjectPosition(){
   if(key!==activeProject)setActiveProject(key);
 }
 function clearPreview(){
+  clearError('preview');
   ++previewSequence;focusId='';previewOffset=0;previewFile=0;
   uiText($('previewTitle'),msg('select_a_session'));$('previewId').hidden=true;uiText($('previewId'),'');
   uiText($('previewMeta'),msg('click_a_session_title_to_view_its_contents'));
@@ -291,8 +293,8 @@ if(previousOffset===previewOffset&&previousFile===previewFile)throw new Error('�
 uiText($('previewMeta'),msg('looking_for_more_messages'));
 $('more').hidden=false;
 }
-uiText($('more'),msg('load_more'));
-}catch(e){if(sequence!==previewSequence)return;error(e);uiText($('previewMeta'),'预览失败：'+e.message);$('more').hidden=false;uiText($('more'),msg('retry_loading'));}finally{if(sequence===previewSequence)$('more').disabled=false;}}
+uiText($('more'),msg('load_more'));clearError('preview');
+}catch(e){if(sequence!==previewSequence)return;error(e,'preview');uiText($('previewMeta'),'预览失败：'+e.message);$('more').hidden=false;uiText($('more'),msg('retry_loading'));}finally{if(sequence===previewSequence)$('more').disabled=false;}}
 for(const id of ['search','project','sort','fileStatus'])$(id).addEventListener(id==='search'?'input':'change',render);
 $('navSearch').oninput=renderProjectNav;
 document.querySelector('.tablewrap').addEventListener('scroll',()=>{if(scrollFrame)return;scrollFrame=requestAnimationFrame(()=>{scrollFrame=0;syncProjectPosition();});},{passive:true});
@@ -300,7 +302,7 @@ $('groupByProject').onclick=()=>{grouped=!grouped;try{localStorage.setItem('clea
 $('selectAll').onchange=()=>{for(const r of filtered())$('selectAll').checked?selected.add(r.id):selected.delete(r.id);render();};
 $('more').onclick=()=>loadPreview(focusId,true);
 $('settings').onclick=()=>{if(!state)return;$('settingsError').hidden=true;$('homeInput').value=state.home;$('cliInput').value=state.cli.path||'';uiText($('cliDetail'),`${state.cli.version}\n${state.cli.message}\n${state.source}`);$('settingsDialog').showModal();};
-$('rescan').onclick=async()=>{try{$('rescan').disabled=true;await api('/api/scan',{});$('diagnosticsDialog').close();}catch(e){error(e);}finally{$('rescan').disabled=false;}};
+$('rescan').onclick=async()=>{try{$('rescan').disabled=true;await api('/api/scan',{});clearError('scan');$('diagnosticsDialog').close();}catch(e){error(e,'scan');}finally{$('rescan').disabled=false;}};
 $('openDiagnostics').onclick=()=>{diagnosticPage=0;$('diagnosticsDialog').showModal();renderDiagnostics();};
 $('closeDiagnostics').onclick=()=>$('diagnosticsDialog').close();
 $('diagnosticPrev').onclick=()=>{diagnosticPage--;renderDiagnostics();$('diagnosticRows').scrollTop=0;};
@@ -308,7 +310,7 @@ $('diagnosticNext').onclick=()=>{diagnosticPage++;renderDiagnostics();$('diagnos
 for(const id of ['diagnosticKind','diagnosticSearch'])$(id).addEventListener(id==='diagnosticKind'?'change':'input',()=>{diagnosticPage=0;renderDiagnostics();$('diagnosticRows').scrollTop=0;});
 $('closeSettings').onclick=()=>$('settingsDialog').close();
 $('saveSettings').onclick=async()=>{$('saveSettings').disabled=true;try{await api('/api/settings',{home:$('homeInput').value,cli:$('cliInput').value});selected.clear();$('settingsDialog').close();}catch(e){uiText($('settingsError'),e.message);$('settingsError').hidden=false;}finally{$('saveSettings').disabled=false;}};
-$('plan').onclick=async()=>{try{activePlan=await api('/api/plan',{ids:[...selected]});$('planDialog').classList.remove('show-result');uiText(document.querySelector('.plan-header h2'),msg('permanent_deletion'));$('execute').hidden=false;$('retryPlan').hidden=true;$('planBody').replaceChildren();for(const e of activePlan.entries){const box=element('div',undefined,'planentry');box.append(content('b',e.title),element('span',e.included_descendant?'（随父会话删除的子会话）':''),element('p',msg('plan_file_count',{id:e.id,count:e.files.length,size:fmt(e.bytes)})));for(const note of e.warnings||[])box.append(element('p',note,'plan-note'));for(const reason of e.blockers)box.append(element('p',reason,'warning'));$('planBody').append(box);}for(const reason of activePlan.blockers)$('planBody').append(element('p',reason,'warning'));const ownEntries=activePlan.entries.filter(e=>selected.has(e.id)),relatedEntries=activePlan.entries.filter(e=>!selected.has(e.id));uiText($('planSummary'),sizeSummary(ownEntries.reduce((s,e)=>s+e.bytes,0),relatedEntries.reduce((s,e)=>s+e.bytes,0),relatedEntries.length,activePlan.entries.length));uiText($('execute'),msg('delete_count',{count:activePlan.entries.length}));$('execute').disabled=!activePlan.allowed;uiText($('result'),'');$('planDialog').showModal();}catch(e){error(e);}};
+$('plan').onclick=async()=>{try{activePlan=await api('/api/plan',{ids:[...selected]});clearError('plan');$('planDialog').classList.remove('show-result');uiText(document.querySelector('.plan-header h2'),msg('permanent_deletion'));$('execute').hidden=false;$('retryPlan').hidden=true;$('planBody').replaceChildren();for(const e of activePlan.entries){const box=element('div',undefined,'planentry');box.append(content('b',e.title),element('span',e.included_descendant?'（随父会话删除的子会话）':''),element('p',msg('plan_file_count',{id:e.id,count:e.files.length,size:fmt(e.bytes)})));if(e.files.some(file=>file.compressed))box.append(element('p',msg('compressed_plan_note'),'plan-note'));for(const note of e.warnings||[])box.append(element('p',note,'plan-note'));for(const reason of e.blockers)box.append(element('p',reason,'warning'));$('planBody').append(box);}for(const reason of activePlan.blockers)$('planBody').append(element('p',reason,'warning'));const ownEntries=activePlan.entries.filter(e=>selected.has(e.id)),relatedEntries=activePlan.entries.filter(e=>!selected.has(e.id));uiText($('planSummary'),sizeSummary(ownEntries.reduce((s,e)=>s+e.bytes,0),relatedEntries.reduce((s,e)=>s+e.bytes,0),relatedEntries.length,activePlan.entries.length));uiText($('execute'),msg('delete_count',{count:activePlan.entries.length}));$('execute').disabled=!activePlan.allowed;uiText($('result'),'');$('planDialog').showModal();}catch(e){error(e,'plan');}};
 $('closeProblems').onclick=()=>$('problemDialog').close();
 $('retryPlan').onclick=()=>{$('planDialog').close();$('plan').click();};
 $('closePlan').onclick=()=>{if(!deleting)$('planDialog').close();};
@@ -320,6 +322,7 @@ function finishDelete(result, failure=''){
  if(completionHandled)return;
  completionHandled=true;completedStarted=Math.max(completedStarted,currentStarted,Date.now()/1000);
  localDelete=false;observedDelete=false;deleting=false;activePlan=null;
+ clearError('delete-stop');
  $('stopDelete').hidden=true;$('deleteProgress').hidden=true;$('closePlan').disabled=false;$('execute').disabled=true;
  const results=result?.results||[];
  for(const item of results)if(item.status==='成功')deletedIds.add(item.id);
@@ -346,11 +349,13 @@ function finishDelete(result, failure=''){
   $('result').scrollIntoView({block:'start'});
  }
  // Unlock immediately; refreshing the list is independent of deletion completion.
- api('/api/scan',{}).catch(e=>error('列表更新失败：'+e.message));
+ api('/api/scan',{}).then(()=>clearError('scan')).catch(e=>error('列表更新失败：'+e.message,'scan'));
 }
 async function pollDeleteProgress(){
  try{const p=await api('/api/delete-progress');
   if(p.running&&p.started>completedStarted){
+   uiText($('result'),'');
+   if(p.stop_requested)clearError('delete-stop');
    currentStarted=p.started;observedDelete=true;deleting=true;completionHandled=false;
    if(!$('planDialog').open){$('planBody').replaceChildren();uiText($('result'),'');uiText($('planSummary'),msg('reconnecting_to_the_running_deletion'));$('planDialog').showModal();}
    $('execute').disabled=true;$('closePlan').disabled=true;selection();
@@ -364,7 +369,7 @@ async function pollDeleteProgress(){
  }catch{}finally{progressTimer=setTimeout(pollDeleteProgress,500);}
 }
 pollDeleteProgress();
-$('stopDelete').onclick=async()=>{try{$('stopDelete').disabled=true;await api('/api/delete-stop',{});uiText($('stopDelete'),msg('stopping'));}catch(e){error(e);$('stopDelete').disabled=false;}};
+$('stopDelete').onclick=async()=>{try{$('stopDelete').disabled=true;await api('/api/delete-stop',{});clearError('delete-stop');uiText($('stopDelete'),msg('stopping'));}catch(e){error(e,'delete-stop');$('stopDelete').disabled=false;}};
 $('execute').onclick=async()=>{
  if(deleting||!activePlan?.allowed)return;
  const planToken=activePlan.token;

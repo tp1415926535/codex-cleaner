@@ -49,7 +49,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     if(!aligned)throw Error('Directory jump did not align target');
     const footer=await page.locator('.files-footer').boundingBox();
     if(footer.y+footer.height>size.height+1)throw Error('File footer clipped');
-    await page.locator('#filesReview').click();await page.locator('#filesPlanDialog').waitFor({state:'visible'});
+    await page.locator('#filesReview').click();await page.locator('#filesPlanDialog').waitFor({state:'visible'});await page.waitForFunction(()=>!document.getElementById('filesExecute').disabled);
     await page.locator('#filesPlanClose').click();
    }
   }

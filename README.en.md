@@ -32,6 +32,8 @@ Opening or refreshing the page always starts in **Sessions**. Selections, filter
 
 Download or clone the project, then double-click `start.cmd`. The tool opens your browser and scans the local Codex data directory.
 
+The launcher first tries `python`, then `py -3`, checking for Python 3.10 or newer. The window stays open after the service exits or startup fails so you can read the output. If it reports that the service is already running, use the original window.
+
 Alternatively, run this from the project directory:
 
 ```powershell
@@ -101,6 +103,10 @@ Choose **All files missing**, then use the table or group checkbox to select mat
 
 These records may remain after files were deleted manually. Because cleanup removes remaining session records, a successful result may reclaim **0 B**. Unreadable files and nonexistent files are different conditions and are not handled interchangeably.
 
+Codex may compress a `.jsonl` rollout into `.jsonl.zst` while retaining the original database path. Both forms are checked. Compressed logs still contain session data, are counted at their actual compressed size, and are excluded from the all-files-missing filter. The list and deletion plan identify compressed logs; post-deletion verification checks both forms. Compressed logs without session metadata appear in scan diagnostics and are never deleted automatically.
+
+Compressed sessions use paginated database history for previews. Without that history, the preview explains that data remains in the compressed log and should be viewed in Codex. Python 3.14's standard library or the optional `zstandard` module can decode bounded headers. Without a decoder, database-referenced compressed logs are still identified, counted, and verified; orphan ownership is never inferred from filenames.
+
 ## Database maintenance
 
 Open **Database maintenance** at the top of the page to inspect database size and internal free space:
@@ -137,6 +143,16 @@ Use the **File cleanup** tab. Directory and list placeholders appear immediately
 The list groups items by top-level folder by default, with a separate group for files in the root. Group headers show item counts, file counts, and sizes. Multi-item groups can be collapsed; group checkboxes select only matching eligible items and exclude protected ones. Group and table-header checkboxes reflect all currently matching items; unselected protected items produce a partial-selection state. Switch to a flat list if preferred. Grouping and collapsed groups are saved with your selection. Summary statistics appear in a compact status bar. The directory sidebar shows the total size and file count of each top-level directory, with search and navigation that expands the target group. Directories without cleanup items show a retention notice. On mobile, navigation appears above the list.
 
 Recommendations cover old sandbox logs and command runners, selected tool caches, known staging directories, and failed atomic state writes. Current and recent runners, referenced paths, active tasks, links, unreadable items, and recent files are protected. Installed plugins, skills, authentication, rules, memories, and database files are retained.
+
+File cleanup also discovers Windows Store and regular Codex desktop installations. Known browser caches under `LocalCache\Roaming\Codex` (or `%APPDATA%\Codex`) and diagnostic logs under `LocalCache\Local\Codex\Logs` (or `%LOCALAPPDATA%\Codex\Logs`) appear in **Codex desktop caches, logs and runtimes**, with their absolute paths. **Scanned storage usage** includes the entire Codex data directory plus identified desktop caches and logs, rather than the entire application package. Desktop logs are grouped by date and follow the 7/30/90-day retention period. Open files are never forcibly deleted.
+
+Desktop caches include embedded-browser partitions' Service Worker `CacheStorage` and `ScriptCache`, HTTP caches, code caches, and GPU caches. They require manual selection: offline web resources will be removed and may be downloaded again. Open this tool in a separate browser, exit Codex, and inspect again before deleting caches. The running state is checked before and during execution. IndexedDB, Local Storage, Cookies, Service Worker databases, login information, application settings, and session data are excluded from this cache allowlist. Personal Edge browser data is not scanned.
+
+The desktop group also lists known legacy executables, fingerprint directories and `cua_node` environments under `%LOCALAPPDATA%\OpenAI\Codex` and Store packages' `LocalCache\Local\OpenAI\Codex`. Manual selection requires no references in checked processes, PATH, startup registry entries, App Paths, scheduled tasks, services, desktop/Start menu shortcuts, startup scripts or common configuration, plus deployed successors verified against installed package hashes. Retention still applies; old runtimes are never auto-recommended. Installed versions, helpers sharing a referenced legacy executable's directory, incomplete audits, unknown directory contents and unverified replacements are retained. Planning and execution repeat the audit; deletion also checks file identity and refuses occupied files. No launch entries, PATH or processes are changed. Static checks cannot cover every project or dynamically constructed paths in arbitrary custom scripts; the deletion plan notes this limitation.
+
+File cleanup confirmation, progress and results share one dialog. You can stop remaining deletions; reloading reconnects to progress. Browser-cache protection checks desktop application image paths, so running the Codex CLI alone does not block caches. Exit the desktop app before cleaning its active browser caches. If the desktop starts during cleanup, the remaining cache files are skipped as one group per source while unaffected items continue. Results count successful, failed, skipped and unprocessed files separately and group reasons with actual paths.
+
+During cache deletion, desktop process checks run about every 100 milliseconds or after at most 32 cache file attempts, whichever comes first, and immediately when switching cache sources. This avoids enumerating all processes for every small file; file identity and open-handle checks still run individually.
 
 Visualizations, generated images, attachments, plans, and configuration backups require manual selection. Review the deletion plan and confirm permanent deletion. The selection is rechecked before execution; changes, usage, or permission problems prevent deletion. Remaining cleanup can be stopped, but deleted files cannot be recovered. Lock files and category roots remain; only empty selected task or staging directories are removed.
 

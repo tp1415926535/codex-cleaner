@@ -123,6 +123,14 @@ body.resizing-preview{cursor:col-resize;user-select:none}
 
 #planDialog{padding:0;overflow:hidden;max-height:90dvh;width:min(800px,95vw)}
 #planDialog[open]{display:flex;flex-direction:column}
+#filesPlanDialog{padding:0;overflow:hidden;max-height:90dvh;width:min(800px,95vw)}
+#filesPlanDialog[open]{display:flex;flex-direction:column}
+#filesPlanDialog #filesPlanList{max-height:none;overflow:visible}
+#filesPlanDialog #filesError{margin:16px 0}
+#filesPlanDialog #filesResult{margin:16px 0;overflow-wrap:anywhere}
+#filesPlanDialog .files-progress{padding:0 0 12px}
+#filesPlanDialog .plan-footer>p{font-size:13px;margin:0 0 12px}
+#filesPlanDialog .actions{margin:0;flex-wrap:wrap}
 .plan-header{flex:none;padding:20px 24px 16px;border-bottom:1px solid #e3e9ed}
 .plan-header h2{margin:0}
 .plan-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:0 18px 18px 24px;margin-right:6px;scrollbar-width:thin}

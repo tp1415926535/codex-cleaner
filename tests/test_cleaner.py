@@ -301,6 +301,151 @@ class Fixture(unittest.TestCase):
         self.assertEqual(result['released'], 0)
         self.assertFalse(result['metadata_present'])
 
+    def compress_file(self, path, keep_original=False):
+        # Valid Zstandard frame using raw blocks; no test dependency required.
+        data = path.read_bytes()
+        frame = b'\x28\xb5\x2f\xfd\xa0' + len(data).to_bytes(4, 'little')
+        chunks = [data[i:i + 65536] for i in range(0, len(data), 65536)] or [b'']
+        for index, chunk in enumerate(chunks):
+            frame += ((len(chunk) << 3) | int(index == len(chunks) - 1)).to_bytes(3, 'little') + chunk
+        target = Path(str(path) + '.zst')
+        target.write_bytes(frame)
+        if not keep_original: path.unlink()
+        return target
+
+    def test_compressed_rollout_counts_data_without_optional_decoder(self):
+        sid, path = self.row()
+        packed = self.compress_file(path)
+        with patch('cleaner.rollouts._zstd_open', return_value=None):
+            self.scan()
+            row = self.store.rows[sid]
+            self.assertEqual(row['size'], packed.stat().st_size)
+            self.assertEqual(row['missing_files'], [])
+            self.assertEqual(row['issues'], [])
+            self.assertEqual([f['path'] for f in row['files']], [str(packed)])
+            state = self.store.snapshot()['rows'][0]
+            self.assertEqual((state['file_count'], state['compressed_file_count']), (1, 1))
+            plan = self.store.plan([sid])
+            self.assertTrue(plan['allowed'])
+            self.assertEqual(plan['bytes'], packed.stat().st_size)
+            self.assertEqual(plan['entries'][0]['warnings'], [])
+            self.assertIn('压缩日志', self.store.preview(sid)['note'])
+
+    def test_compressed_rollout_direct_reference_and_both_forms(self):
+        sid, path = self.row()
+        packed = self.compress_file(path, keep_original=True)
+        with fixture_db(self.db) as c:
+            c.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(packed), sid))
+        with patch('cleaner.rollouts._zstd_open', return_value=None): self.scan()
+        row = self.store.rows[sid]
+        self.assertEqual(len(row['files']), 2)
+        self.assertEqual(row['size'], path.stat().st_size + packed.stat().st_size)
+        self.assertEqual(row['missing_files'], [])
+
+    def test_orphan_compressed_file_is_reported_without_guessing_from_filename(self):
+        sid = str(uuid.uuid4())
+        packed = self.compress_file(self.file(sid))
+        with patch('cleaner.rollouts._zstd_open', return_value=None): self.scan()
+        diagnostic = next(d for d in self.store.diagnostics if d['path'] == str(packed))
+        self.assertEqual(diagnostic['kind'], 'orphan')
+        self.assertEqual(diagnostic['size'], packed.stat().st_size)
+        self.assertIsNone(diagnostic['owner'])
+        self.assertEqual(self.store.rows, {})
+
+    def test_compressed_header_decoding_is_bounded_and_finds_explicit_owner(self):
+        from cleaner.rollouts import header_line
+        sid, original = self.row()
+        second = self.file(sid, 'second.jsonl')
+        header = second.read_bytes()
+        with second.open('ab') as stream: stream.write(b'x' * 300000)
+        packed = self.compress_file(second)
+        decoded = header_line(packed, 256 * 1024)
+        if decoded is None: self.skipTest('Optional Zstandard decoder unavailable')
+        self.assertEqual(decoded, header)
+        self.scan()
+        self.assertEqual({f['path'] for f in self.store.rows[sid]['files']}, {str(original), str(packed)})
+        self.assertFalse(self.store.diagnostics)
+
+    def test_compressed_file_changes_invalidate_plan(self):
+        sid, path = self.row()
+        packed = self.compress_file(path)
+        with patch('cleaner.rollouts._zstd_open', return_value=None):
+            self.scan()
+            plan = self.store.plan([sid])
+            packed.write_bytes(packed.read_bytes() + b'changed')
+            with self.assertRaises(ValueError): self.store.delete(plan['token'])
+
+    def test_shared_compressed_path_is_not_reclaimable(self):
+        first, path = self.row()
+        second, _ = self.row(path=path)
+        packed = self.compress_file(path)
+        with patch('cleaner.rollouts._zstd_open', return_value=None): self.scan()
+        for sid in (first, second):
+            self.assertEqual(self.store.rows[sid]['files'][0]['path'], str(packed))
+            self.assertEqual(self.store.rows[sid]['reclaimable'], 0)
+            self.assertFalse(self.store.plan([sid])['allowed'])
+
+    def test_compressed_file_outside_session_directories_is_blocked(self):
+        sid, path = self.row()
+        packed = self.compress_file(path)
+        outside = self.home / 'outside.jsonl.zst'
+        packed.rename(outside)
+        with fixture_db(self.db) as c:
+            c.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(outside), sid))
+        self.scan()
+        self.assertFalse(self.store.plan([sid])['allowed'])
+        self.assertTrue(any(d['kind'] == 'unsafe' for d in self.store.diagnostics))
+
+    def test_compressed_paginated_preview_uses_database_history(self):
+        sid, path = self.row(history='paginated')
+        packed = self.compress_file(path)
+        with fixture_db(self.home / 'thread_history_1.sqlite') as c:
+            c.execute('CREATE TABLE thread_items(thread_id,turn_id,item_id,rollout_ordinal,item_type,item_json)')
+            c.execute('CREATE TABLE thread_turns(thread_id,turn_id,final_agent_item_id)')
+            c.execute('INSERT INTO thread_items VALUES(?,?,?,?,?,?)',
+                      (sid, 'turn', 'item', 0, 'userMessage', json.dumps({'content':[{'type':'text','text':'压缩会话内容'}]})))
+        with patch('cleaner.rollouts._zstd_open', return_value=None): self.scan()
+        page = self.store.preview(sid)
+        self.assertEqual(page['messages'][0]['text'], '压缩会话内容')
+        self.assertEqual(page['files'][0]['path'], str(packed))
+
+    def test_compression_after_confirmation_invalidates_missing_file_plan(self):
+        sid, path = self.row()
+        packed = self.compress_file(path)
+        data = packed.read_bytes()
+        packed.unlink()
+        self.scan()
+        plan = self.store.plan([sid])
+        packed.write_bytes(data)
+        with patch('cleaner.rollouts._zstd_open', return_value=None):
+            with self.assertRaises(ValueError): self.store.delete(plan['token'])
+
+    def test_compressed_delete_checks_residue_and_actual_released_bytes(self):
+        for mode, expected in [('partial', '部分完成'), ('success', '成功')]:
+            with self.subTest(mode=mode), patch('cleaner.rollouts._zstd_open', return_value=None):
+                sid, path = self.row()
+                packed = self.compress_file(path)
+                self.scan()
+                size = packed.stat().st_size
+                self.store.runner = self.mock_delete(mode)
+                result = self.store.delete(self.store.plan([sid])['token'])['results'][0]
+                self.assertEqual(result['status'], expected)
+                self.assertEqual(result['released'], size if mode == 'success' else 0)
+                self.assertEqual(bool(result['leftovers']), mode == 'partial')
+
+    def test_cli_recompressing_original_is_not_reported_as_complete_deletion(self):
+        sid, path = self.row()
+        self.scan()
+        def runner(*args, **kwargs):
+            self.compress_file(path)
+            with fixture_db(self.db) as c: c.execute('DELETE FROM threads WHERE id=?', (sid,))
+            return subprocess.CompletedProcess([], 0, '', '')
+        self.store.runner = runner
+        result = self.store.delete(self.store.plan([sid])['token'])['results'][0]
+        self.assertEqual(result['status'], '部分完成')
+        self.assertEqual(result['released'], 0)
+        self.assertEqual(result['leftovers'][0]['path'], str(path) + '.zst')
+
     def test_reappearing_missing_file_invalidates_plan(self):
         a, p = self.row()
         p.unlink()

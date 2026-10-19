@@ -20,6 +20,8 @@ from app import make_server
 
 class FileCleanupTests(unittest.TestCase):
     def setUp(self):
+        desktop = patch('cleaner.files.desktop_sources', return_value={})
+        desktop.start(); self.addCleanup(desktop.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.home = Path(self.temporary.name)
         self.store = SimpleNamespace(home=self.home, current=set(), cli={'version': 'codex-cli current'},

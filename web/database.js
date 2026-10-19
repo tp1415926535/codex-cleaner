@@ -3,7 +3,7 @@
  let report=null,plan=null,observed=false,starting=false,reportHome='',inspecting=false;
  const dialog=$('databaseWorkspace');
  const description={'thread_history_1.sqlite':'db_history','logs_2.sqlite':'db_logs','state_5.sqlite':'db_state'};
- function showError(e){$('dbError').hidden=false;uiText($('dbError'),msg('db_error',{detail:e.message||String(e)}));}
+ const errors=createErrorReporter($('dbError'),detail=>msg('db_error',{detail}));
  function invalidate(){plan=null;$('dbPlan').hidden=true;$('dbExecute').hidden=true;$('dbReview').hidden=false;}
  function save(){if(!reportHome)return;try{localStorage.setItem('cleaner.database:'+reportHome,JSON.stringify({names:[...dialog.querySelectorAll('#dbTable input:checked')].map(input=>input.value),days:$('dbLogDays').value}));}catch{}}
  function controls(busy){
@@ -18,7 +18,7 @@
   inspecting=true;
   const requestedHome=state.home;let saved=null;
   try{saved=JSON.parse(localStorage.getItem('cleaner.database:'+requestedHome)||'null');}catch{}
-  $('dbLoading').hidden=false;uiText($('dbLoading'),msg('db_loading'));$('dbError').hidden=true;report=null;controls(false);
+  $('dbLoading').hidden=false;uiText($('dbLoading'),msg('db_loading'));report=null;controls(false);
   try{
    const next=await api('/api/database-inspect');if(state.home!==requestedHome)return;
    report=next;reportHome=requestedHome;$('dbTable').replaceChildren();
@@ -39,32 +39,38 @@
    $('dbUnmatched').hidden=!history?.unmatched_sessions;
    if(history?.unmatched_sessions)uiText($('dbUnmatched'),msg('db_unmatched',{count:history.unmatched_sessions,records:history.unmatched_records?.thread_items||0}));
    save();
-  }catch(e){showError(e);}finally{inspecting=false;$('dbLoading').hidden=true;controls(databaseBusy);}
+   errors.clear('inspect');errors.clear('plan');errors.clear('start');
+  }catch(e){errors.show(e,'inspect');}finally{inspecting=false;$('dbLoading').hidden=true;controls(databaseBusy);}
  }
  window.addEventListener('cleaner-tab-change',event=>{if(event.detail==='database'&&!report&&!databaseBusy)inspect();});
  if(activeTab==='database')inspect();
  $('dbLogDays').onchange=()=>{invalidate();save();};
  $('dbClose').onclick=()=>{if(!databaseBusy){invalidate();inspect();}};
  $('dbReview').onclick=async()=>{
-  $('dbError').hidden=true;$('dbReview').disabled=true;
+  $('dbReview').disabled=true;
   try{
    const names=[...dialog.querySelectorAll('#dbTable input:checked')].map(input=>input.value);
    const log_days=$('dbLogDays').value===''?null:Number($('dbLogDays').value);
    plan=await api('/api/database-plan',{names,log_days});$('dbPlan').replaceChildren();
    $('dbPlan').append(element('p',msg('db_plan',{count:plan.entries.length,size:fmt(plan.entries.reduce((sum,d)=>sum+d.free_bytes,0))})));
-   for(const entry of plan.entries)$('dbPlan').append(element('p',msg('db_plan_entry',{name:entry.name,size:fmt(entry.free_bytes)})));
+   for(const entry of plan.entries){
+    $('dbPlan').append(element('p',msg('db_plan_entry',{name:entry.name,size:fmt(entry.free_bytes)})));
+    if(entry.required_temp_bytes!==undefined)$('dbPlan').append(element('p',msg('db_plan_space',{required:fmt(entry.required_temp_bytes),available:fmt(entry.available_bytes)})));
+    if(entry.shortfall_bytes)$('dbPlan').append(element('p',msg('db_plan_space_shortfall',{size:fmt(entry.shortfall_bytes)}),'warning'));
+   }
    $('dbPlan').append(element('p',log_days===null?msg('db_no_log_delete'):msg('db_log_delete',{count:plan.entries.reduce((sum,d)=>sum+d.logs_to_delete,0),date:new Date(plan.cutoff*1000).toLocaleString(I18N.language==='en'?'en-US':'zh-CN')})));
    $('dbPlan').hidden=false;$('dbExecute').hidden=false;$('dbReview').hidden=true;$('dbPlan').scrollIntoView({block:'nearest'});
-  }catch(e){showError(e);}finally{$('dbReview').disabled=false;}
+   errors.clear('plan');errors.clear('start');
+  }catch(e){errors.show(e,'plan');}finally{$('dbReview').disabled=false;}
  };
  $('dbExecute').onclick=async()=>{
-  if(!plan||databaseBusy)return;starting=true;controls(true);$('dbError').hidden=true;$('dbProgress').hidden=false;
+  if(!plan||databaseBusy)return;starting=true;controls(true);$('dbProgress').hidden=false;
   uiText($('dbProgressText'),msg('db_starting'));
-  try{await api('/api/database-start',{token:plan.token,confirmed:true});observed=true;plan=null;}
-  catch(e){showError(e);controls(false);$('dbProgress').hidden=true;}
+  try{await api('/api/database-start',{token:plan.token,confirmed:true});errors.clear('start');observed=true;plan=null;}
+  catch(e){errors.show(e,'start');controls(false);$('dbProgress').hidden=true;}
   finally{starting=false;}
  };
- $('dbStop').onclick=async()=>{try{$('dbStop').disabled=true;await api('/api/database-stop',{});}catch(e){showError(e);$('dbStop').disabled=false;}};
+ $('dbStop').onclick=async()=>{try{$('dbStop').disabled=true;await api('/api/database-stop',{});errors.clear('stop');}catch(e){errors.show(e,'stop');$('dbStop').disabled=false;}};
  function results(p){
   $('dbResults').replaceChildren();$('dbResults').hidden=false;
   $('dbResults').append(element('h3',msg('db_finished',{size:fmt(p.results.reduce((sum,r)=>sum+r.released,0))})));
@@ -74,15 +80,16 @@
  async function progress(){
   try{const p=await api('/api/database-progress');
    if(p.running){
+    errors.clear('start');if(p.stopping)errors.clear('stop');
     observed=true;controls(true);
     $('dbProgress').hidden=false;$('dbProgressBar').max=p.total||1;$('dbProgressBar').value=p.done;
     uiText($('dbProgressText'),msg('db_progress',{done:p.done,total:p.total,name:p.database,phase:msg(p.stopping?'db_stopping':'db_phase_'+p.phase)}));
     $('dbStop').disabled=!!p.stopping;
-   }else if(observed&&!starting){observed=false;controls(false);$('dbProgress').hidden=true;invalidate();results(p);inspect();}
+   }else if(observed&&!starting){errors.clear('start');errors.clear('stop');observed=false;controls(false);$('dbProgress').hidden=true;invalidate();results(p);inspect();}
   }catch{}finally{controls(databaseBusy);setTimeout(progress,1000);}
  }
  window.addEventListener('cleaner-state-change',()=>{
-  if(reportHome&&reportHome!==state.home){report=null;reportHome='';invalidate();}
+  if(reportHome&&reportHome!==state.home){report=null;reportHome='';errors.reset();invalidate();}
   if(activeTab==='database'&&!report&&!databaseBusy)inspect();
  });
  window.addEventListener('pagehide',save);

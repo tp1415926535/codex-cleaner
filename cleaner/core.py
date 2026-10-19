@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from .activity import thread_activity, verify_cli_protocol
 from .maintenance import DatabaseMaintenance
 from .files import FileCleanup
+from .rollouts import compressed, present_variants, header_line
 
 Path = pathlib.Path
 HEADER_LIMIT = 256 * 1024
@@ -237,13 +238,15 @@ class Store:
     def safe_file(self, path):
         p = canonical(path)
         # A reparse-point root must not make an unrelated directory eligible.
-        return any(p.is_relative_to(self.home / folder) for folder in ('sessions', 'archived_sessions')) and p.suffix.lower() == '.jsonl'
+        return any(p.is_relative_to(self.home / folder) for folder in ('sessions', 'archived_sessions')) and (p.suffix.lower() == '.jsonl' or compressed(p))
 
     def header(self, path, stat):
         key = (str(path), stat.st_size, stat.st_mtime_ns)
         if key not in self.header_cache:
-            with path.open('rb') as f:
-                raw = f.readline(HEADER_LIMIT + 1)
+            raw = header_line(path, HEADER_LIMIT)
+            if raw is None:
+                self.header_cache[key] = (None, 'Zstandard 压缩日志；未解码文件头')
+                return self.header_cache[key]
             try:
                 data = json.loads(raw) if len(raw) <= HEADER_LIMIT else {}
                 meta = data.get('payload', {}) if data.get('type') == 'session_meta' else {}
@@ -286,14 +289,17 @@ class Store:
             refs = defaultdict(set)
             for sid, row in rows.items():
                 p = canonical(row['rollout_path'])
-                refs[str(p)].add(sid)
-                if not self.safe_file(p):
-                    row['issues'].append('数据库引用路径超出 sessions/archived_sessions，禁止操作')
+                for physical in present_variants(p) or [p]:
+                    physical = canonical(physical)
+                    refs[str(physical)].add(sid)
+                    if not self.safe_file(physical):
+                        row['issues'].append('数据库引用路径超出 sessions/archived_sessions，禁止操作')
             paths = set(refs)
             for folder in ('sessions', 'archived_sessions'):
                 root = self.home / folder
                 if root.exists():
                     paths.update(str(canonical(p)) for p in root.rglob('*.jsonl'))
+                    paths.update(str(canonical(p)) for p in root.rglob('*.jsonl.zst'))
             seen = {}
             for i, name in enumerate(sorted(paths)):
                 if self.cancel.is_set():
@@ -323,6 +329,7 @@ class Store:
                         'identity': [st.st_dev, st.st_ino],
                         'evidence': evidence + (' + threads.rollout_path' if refs[name] else ''),
                         'shared': len(claims) > 1 or conflict or hardlink}
+                if compressed(p): item['compressed'] = True
                 if not claims:
                     self.diagnostics.append({**item, 'reason': '无权威会话归属；不使用文件名 UUID 猜测', 'kind': 'orphan', 'thread_ids': [], 'owner': owner}); continue
                 parent = self.header_parents.get((str(p), st.st_size, st.st_mtime_ns))
@@ -373,7 +380,8 @@ class Store:
                     row['state'] = '当前会话 · 禁止删除' if sid in self.current else ('归档' if row['archived'] else '普通') + ' · ' + activity['label']
                 self.activity_checked_at = time.monotonic()
         with self.lock:
-            return {'rows': [{**{k: v for k, v in row.items() if k not in ('files', 'first_user_message')}, 'file_count': len(row['files'])} for row in self.rows.values()],
+            return {'rows': [{**{k: v for k, v in row.items() if k not in ('files', 'first_user_message')}, 'file_count': len(row['files']),
+                              'compressed_file_count': sum(bool(f.get('compressed')) for f in row['files'])} for row in self.rows.values()],
                     'spawn_edges': {parent: sorted(children) for parent, children in self.edges.items()},
                     'display_edges': {parent: sorted(children) for parent, children in self.display_edges.items()},
                     'diagnostics': self.diagnostics[:1000], 'diagnostic_count': len(self.diagnostics),
@@ -396,7 +404,7 @@ class Store:
         internal = row['kind'] == 'internal'
         history = self.home / 'thread_history_1.sqlite'
         # A resumed session can span several rollouts; the projection may cover only one.
-        if len([f for f in row['files'] if not f['shared']]) > 1:
+        if len([f for f in row['files'] if not f['shared']]) > 1 and not any(f.get('compressed') for f in row['files']):
             return self.legacy_preview(row, offset, file_index)
         if row.get('history_mode') == 'paginated' and history.exists():
             with db_open(history) as c:
@@ -433,6 +441,11 @@ class Store:
             return {'messages': [], 'next': None, 'note': '没有可安全预览的关联文件', 'files': row['files']}
         path = Path(files[file_index]['path'])
         if not self.safe_file(path): raise ValueError('文件越界')
+        if compressed(path):
+            next_file = file_index + 1
+            return {'messages': [], 'next': 0 if next_file < len(files) else None,
+                    'file_index': next_file, 'files': row['files'],
+                    'note': '会话数据仍保存在 Zstandard 压缩日志中；没有可用的分页历史，请在 Codex 中查看内容。'}
         messages = []
         internal = row['kind'] == 'internal'
         used = 0
@@ -625,12 +638,21 @@ class Store:
                 self.delete_progress = {**self.delete_progress, 'phase': '核实清理结果'}
                 for entry in group:
                     leftovers, released = [], 0
+                    checked = set()
                     for f in entry['files']:
-                        if Path(f['path']).exists(): leftovers.append(f)
-                        else: released += f['size']
+                        remaining = present_variants(f['path'])
+                        for path in remaining:
+                            if str(path) not in checked:
+                                checked.add(str(path))
+                                leftovers.append(f if str(path) == f['path'] else {'path': str(path), 'size': path.stat().st_size,
+                                    'evidence': '原关联日志的另一种存储形式'})
+                        if not remaining: released += f['size']
                     for path in entry['missing_files']:
-                        if Path(path).exists():
-                            leftovers.append({'path': path, 'size': 0, 'evidence': 'threads.rollout_path（计划时已缺失，执行后重新出现）'})
+                        for physical in present_variants(path):
+                            if str(physical) not in checked:
+                                checked.add(str(physical))
+                                leftovers.append({'path': str(physical), 'size': physical.stat().st_size,
+                                    'evidence': 'threads.rollout_path（计划时已缺失，执行后重新出现）'})
                     try:
                         with db_open(self.state_path) as c:
                             present = bool(c.execute('SELECT EXISTS(SELECT 1 FROM threads WHERE id=?)', (entry['id'],)).fetchone()[0])

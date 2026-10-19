@@ -47,6 +47,18 @@ class DatabaseMaintenance:
     def disk_bytes(path):
         return sum(p.stat().st_size for p in (path, Path(str(path) + '-wal')) if p.exists())
 
+    @staticmethod
+    def compaction_space(path):
+        # SQLite may need a temporary copy plus a journal/WAL for the rewrite.
+        required = max(path.stat().st_size * 2, 16 * 1024 * 1024)
+        available = shutil.disk_usage(path.parent).free
+        return {'required_temp_bytes': required, 'available_bytes': available,
+                'shortfall_bytes': max(0, required - available)}
+
+    @staticmethod
+    def space_label(size):
+        return f'{size / 1024 ** 3:.2f} GiB' if size >= 1024 ** 3 else f'{size / 1024 ** 2:.2f} MiB'
+
     def inspect(self):
         reports = []
         for name in DATABASES:
@@ -63,6 +75,7 @@ class DatabaseMaintenance:
                     report = {'name': name, 'exists': True, 'bytes': path.stat().st_size,
                               'wal_bytes': max(0, self.disk_bytes(path) - path.stat().st_size),
                               'logical_bytes': pages * page_size, 'free_bytes': free * page_size}
+                    report.update(self.compaction_space(path))
                     if name == 'logs_2.sqlite' and 'logs' in tables:
                         report['records'] = c.execute('SELECT count(*) FROM logs').fetchone()[0]
                     if name == 'thread_history_1.sqlite':
@@ -152,9 +165,12 @@ class DatabaseMaintenance:
                 try:
                     path = self.path(name)
                     before = self.disk_bytes(path)
-                    # VACUUM is transactional and may require twice the DB size in spare disk.
-                    if shutil.disk_usage(path.parent).free < max(path.stat().st_size * 2, 16 * 1024 * 1024):
-                        raise ValueError('Not enough temporary disk space to compact the database')
+                    space = self.compaction_space(path)
+                    result.update(space)
+                    if space['shortfall_bytes']:
+                        raise ValueError('临时磁盘空间不足：可用 ' + self.space_label(space['available_bytes']) +
+                                         '，预计需预留 ' + self.space_label(space['required_temp_bytes']) +
+                                         '，还差 ' + self.space_label(space['shortfall_bytes']) + '。请释放空间后重试。')
                     with self.connection(path, writable=True) as c:
                         c.set_progress_handler(lambda: int(self.stop.is_set()), 10000)
                         if c.execute('PRAGMA quick_check').fetchone()[0] != 'ok':

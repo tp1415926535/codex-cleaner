@@ -1,10 +1,16 @@
 'use strict';
 (()=>{
  let report=null,chosen=new Set(),home='',plan=null,loading=false,observed=false,starting=false,sequence=0,pendingSince=0;
+ let planning=false,planSequence=0,planController=null;
+ let stopRequested=false,stopping=false;
  let browserId='',browserOffset=0,browserNext=null,browserSequence=0,browserTimer,browserReport=null;
  let previewPath='',previewToken='',previewSequence=0,previewData=null,noticeTimer;
  let folderGrouped=true,closedFolders=new Set();
  let activeFolder='',emptyFolder='',navigationScroll=null,folderHeaders=new Map(),folderButtons=new Map();
+ const errors=createErrorReporter($('filesError'));
+ const errorParent=$('filesError').parentElement,errorNext=$('filesError').nextElementSibling;
+ function openPlanDialog(){const dialog=$('filesPlanDialog');dialog.querySelector('.plan-scroll').prepend($('filesError'));if(!dialog.open)dialog.showModal();}
+ function folderName(key){return key==='.'?I18N.format('files_root'):key==='desktop-app'?I18N.format('files_desktop'):key;}
  function imageUrl(token,path){return '/api/files-image?'+new URLSearchParams({token,path});}
  async function reveal(id,button,path='',token=''){
   button.disabled=true;clearTimeout(noticeTimer);
@@ -93,15 +99,21 @@
  $('fileBrowserNext').onclick=()=>{if(browserNext!==null)browse(browserNext);};
  function save(){if(!home||report?.complete===false)return;try{localStorage.setItem('cleaner.files:'+home,JSON.stringify({chosen:[...chosen],days:$('filesDays').value,search:$('filesSearch').value,filter:$('filesFilter').value,grouped:folderGrouped,closedFolders:[...closedFolders]}));}catch{}}
  function restore(next){
-  if(next===home)return false;home=next;chosen=new Set();folderGrouped=true;closedFolders=new Set();activeFolder='';emptyFolder='';$('filesNavSearch').value='';
+  if(next===home)return false;home=next;errors.reset();chosen=new Set();folderGrouped=true;closedFolders=new Set();activeFolder='';emptyFolder='';$('filesNavSearch').value='';
   try{const saved=JSON.parse(localStorage.getItem('cleaner.files:'+home)||'null');if(saved){chosen=new Set(saved.chosen||[]);if(typeof saved.grouped==='boolean')folderGrouped=saved.grouped;closedFolders=new Set(saved.closedFolders||[]);for(const [field,id] of [['days','filesDays'],['search','filesSearch'],['filter','filesFilter']])if(typeof saved[field]==='string')$(id).value=saved[field];return true;}}catch{}
   return false;
  }
- function matches(){const query=$('filesSearch').value.toLocaleLowerCase(),filter=$('filesFilter').value;return (report?.entries||[]).filter(entry=>entry.id.toLocaleLowerCase().includes(query)&&(filter==='all'||filter==='recommended'&&entry.recommended||filter==='allowed'&&entry.allowed&&!entry.recommended||filter==='protected'&&!entry.allowed));}
+ function matches(){const query=$('filesSearch').value.toLocaleLowerCase(),filter=$('filesFilter').value;return (report?.entries||[]).filter(entry=>[entry.id,entry.name,entry.path||''].some(value=>value.toLocaleLowerCase().includes(query))&&(filter==='all'||filter==='recommended'&&entry.recommended||filter==='allowed'&&entry.allowed&&!entry.recommended||filter==='protected'&&!entry.allowed));}
  function controls(){
-  const blocked=loading||report?.complete===false||filesBusy||deleting||databaseBusy;
+  const blocked=loading||planning||report?.complete===false||filesBusy||deleting||databaseBusy;
   $('filesReview').disabled=blocked||!chosen.size||!report;
-  $('filesRefresh').disabled=loading||filesBusy;$('filesAuto').disabled=blocked||!report;$('filesDays').disabled=filesBusy;
+  uiText($('filesReview'),msg(planning?'files_plan_building':'review_deletion'));
+  $('filesReview').setAttribute('aria-busy',String(planning));
+  $('filesExecute').disabled=planning||!plan||filesBusy||deleting||databaseBusy;
+  $('filesPlanClose').disabled=filesBusy||starting;
+  $('filesRetry').disabled=loading||planning||filesBusy;
+  $('filesStop').disabled=starting||stopping||stopRequested;
+  $('filesRefresh').disabled=loading||planning||filesBusy;$('filesAuto').disabled=blocked||!report;$('filesDays').disabled=planning||filesBusy;
   $('filesSelectAll').disabled=blocked||!report||!matches().some(entry=>entry.allowed);$('filesNavSearch').disabled=!report;
   for(const input of $('filesRows').querySelectorAll('input'))input.disabled=blocked||input.dataset.protected==='true';
   if(state)selection();
@@ -143,12 +155,12 @@
   // Keep groups navigable even if an older report lacks their inventory row.
   for(const group of folderGroups(report.entries))if(!folders.some(folder=>folder.name===group.key))folders.push({name:group.key,bytes:group.bytes,files:group.files,issues:0});
   folders.sort((a,b)=>b.bytes-a.bytes||a.name.localeCompare(b.name));
-  const query=$('filesNavSearch').value.trim().toLocaleLowerCase(),visible=folders.filter(folder=>(folder.name==='.'?I18N.format('files_root'):folder.name).toLocaleLowerCase().includes(query));
+  const query=$('filesNavSearch').value.trim().toLocaleLowerCase(),visible=folders.filter(folder=>folderName(folder.name).toLocaleLowerCase().includes(query));
   uiText($('filesNavCount'),query?`${visible.length} / ${folders.length}`:String(folders.length));
   for(const folder of visible){
    const button=element('button',undefined,'nav-project');button.dataset.folder=folder.name;
    const name=element('span',undefined,'nav-project-name'),icon=element('span',undefined,'folder-icon');icon.setAttribute('aria-hidden','true');
-   name.append(icon,folder.name==='.'?element('span',msg('files_root')):content('span',folder.name));
+   name.append(icon,content('span',folderName(folder.name)));
    const meta=element('span',undefined,'nav-project-meta');meta.append(element('span',folder.pending?msg('files_checking'):msg('files_count',{count:folder.files})),element('span',folder.pending&&!folder.files?'—':fmt(folder.bytes)));
    button.append(name,meta);if(folder.issues)button.append(element('small',msg('files_directory_issues',{count:folder.issues}),'nav-directory-issues'));
    button.onclick=()=>jumpToFolder(folder.name);list.append(button);folderButtons.set(folder.name,button);
@@ -160,8 +172,9 @@
   row.dataset.fileId=entry.id;
   const cell=element('td'),check=element('input');check.type='checkbox';check.checked=chosen.has(entry.id);check.dataset.protected=String(!entry.allowed);check.disabled=!entry.allowed;
   I18N.attribute(check,'aria-label',msg('files_select_item',{path:entry.id}));check.onchange=()=>{check.checked?chosen.add(entry.id):chosen.delete(entry.id);plan=null;render();};cell.append(check);
-  const path=element('td'),name=group&&group.key!=='.'?entry.name.slice(group.key.length+1):entry.name;
-  const label=content('span',name,'file-name');label.title=entry.name;path.append(label);
+  const path=element('td'),name=group&&group.key!=='.'&&entry.name.startsWith(group.key+'/')?entry.name.slice(group.key.length+1):entry.name;
+  const label=content('span',name,'file-name');label.title=entry.path||entry.name;path.append(label);
+  if(entry.path)path.append(content('small',entry.path,'files-path'));
   const meta=element('div',undefined,'file-meta');meta.append(element('small',msg('files_count',{count:entry.files})));
   const view=element('button',msg(entry.files>1?'files_browse':'files_preview'),'file-view');view.onclick=()=>openBrowser(entry);meta.append(view);
   const folder=element('button',msg('files_open_folder'),'file-open-folder');folder.onclick=()=>reveal(entry.id,folder);meta.append(folder);
@@ -185,7 +198,7 @@
   if(!collapsible)toggle.tabIndex=-1;
   const arrow=element('span',undefined,'group-chevron');arrow.setAttribute('aria-hidden','true');toggle.append(arrow);
   if(collapsible){toggle.setAttribute('aria-expanded',String(!closed));toggle.onclick=()=>{closed?closedFolders.delete(group.key):closedFolders.add(group.key);render();};}
-  const icon=element('span',undefined,'folder-icon');icon.setAttribute('aria-hidden','true');toggle.append(icon,group.key==='.'?element('span',msg('files_root'),'group-name'):content('span',group.key,'group-name'));
+  const icon=element('span',undefined,'folder-icon');icon.setAttribute('aria-hidden','true');toggle.append(icon,content('span',folderName(group.key),'group-name'));
   bar.append(toggle,element('span',msg('files_group_summary',{count:group.entries.length,files:group.files,size:fmt(group.bytes)}),'group-stats'));heading.append(bar);row.append(heading);$('filesRows').append(row);
   if(!closed)for(const entry of group.entries)$('filesRows').append(entryRow(entry,group));
   if(!group.entries.length){const empty=element('tr',undefined,'file-folder-empty'),cell=element('td',msg(report.complete===false?'files_reason_scanning':'files_directory_empty'));cell.colSpan=5;empty.append(cell);$('filesRows').append(empty);}
@@ -213,13 +226,13 @@
   save();controls();
  }
  async function inspect(){
-  if(loading||filesBusy||!state?.home)return;
+  if(loading||planning||filesBusy||!state?.home)return;
   const restored=restore(state.home),first=!report||report.home!==home;
   layout();
   const requestedDays=Number($('filesDays').value),requestedHome=home,request=++sequence;
   const previous=report?.home===home&&report.complete!==false?report:null;
   let completed=false;
-  loading=true;loadingState();$('filesError').hidden=true;controls();plan=null;
+  loading=true;loadingState();controls();plan=null;
   uiText($('filesLoading').querySelector('strong'),msg('files_loading'));
   uiText($('filesScanText'),msg('files_loading'));
   function apply(next){
@@ -239,7 +252,8 @@
     finally{reader.releaseLock();}
    }else apply(await response.json());
    if(!completed)throw new Error(I18N.format('files_scan_interrupted'));
-  }catch(error){uiText($('filesError'),error.message);$('filesError').hidden=false;}
+   errors.clear('inspect');errors.clear('plan');errors.clear('start');
+  }catch(error){errors.show(error,'inspect');}
   finally{loading=false;loadingState();controls();}
  }
  $('filesRefresh').onclick=inspect;
@@ -261,35 +275,67 @@
  });
  $('filesSelectAll').onchange=()=>{const eligible=matches().filter(entry=>entry.allowed),allSelected=eligible.length>0&&eligible.every(entry=>chosen.has(entry.id));for(const entry of eligible)allSelected?chosen.delete(entry.id):chosen.add(entry.id);plan=null;render();};
  $('filesReview').onclick=async()=>{
-  $('filesReview').disabled=true;$('filesError').hidden=true;
+  if(planning||loading||filesBusy||deleting||databaseBusy||!chosen.size||!report||report.complete===false)return;
+  const request=++planSequence,requestedHome=home,controller=new AbortController();
+  planning=true;plan=null;planController=controller;controls();
+  $('filesResult').hidden=true;$('filesProgress').hidden=true;$('filesStop').hidden=true;$('filesRetry').hidden=true;$('filesExecute').hidden=false;
+  $('filesPlanList').hidden=false;$('filesPlanWarning').hidden=false;uiText($('filesPlanTitle'),msg('files_plan_title'));uiText($('filesPlanClose'),msg('cancel_settings'));
+  uiText($('filesPlanSummary'),'');$('filesPlanList').replaceChildren();$('filesPlanLoading').hidden=false;
+  openPlanDialog();
   try{
-   plan=await api('/api/files-plan',{ids:[...chosen],days:Number($('filesDays').value)});
+   const next=await api('/api/files-plan',{ids:[...chosen],days:Number($('filesDays').value)},{signal:controller.signal});
+   if(request!==planSequence)return;
+   if(requestedHome!==state?.home){$('filesPlanDialog').close();return;}
+   plan=next;
    uiText($('filesPlanSummary'),msg('files_plan_summary',{count:plan.entries.length,files:plan.files,size:fmt(plan.bytes)}));
-   $('filesPlanList').replaceChildren(...plan.entries.map(entry=>content('p',entry.name+' · '+fmt(entry.bytes))));
-   $('filesExecute').disabled=false;$('filesPlanDialog').showModal();
-  }catch(error){uiText($('filesError'),error.message);$('filesError').hidden=false;}
-  finally{controls();}
+   $('filesPlanList').replaceChildren(...plan.entries.map(entry=>{const item=content('p',(entry.path||entry.name)+' · '+fmt(entry.bytes));if(entry.kind==='cache'||entry.kind==='runtime')item.append(element('small',msg(entry.kind==='cache'?'files_desktop_cache_note':'files_runtime_note'),'files-reason'));return item;}));
+   errors.clear('plan');errors.clear('start');
+  }catch(error){if(request===planSequence&&error.name!=='AbortError'){$('filesPlanDialog').close();errors.show(error,'plan');}}
+  finally{if(request===planSequence){planning=false;planController=null;$('filesPlanLoading').hidden=true;controls();}}
  };
- $('filesPlanClose').onclick=()=>$('filesPlanDialog').close();
+ $('filesPlanClose').onclick=()=>{if(!filesBusy&&!starting)$('filesPlanDialog').close();};
+ $('filesPlanDialog').addEventListener('cancel',event=>{if(filesBusy||starting)event.preventDefault();});
+ $('filesPlanDialog').addEventListener('close',()=>{++planSequence;planController?.abort();planController=null;planning=false;plan=null;$('filesPlanLoading').hidden=true;errorParent.insertBefore($('filesError'),errorNext);controls();});
+ $('filesRetry').onclick=()=>{$('filesPlanDialog').close();inspect();};
  $('filesExecute').onclick=async()=>{
-  if(!plan||filesBusy)return;starting=true;filesBusy=true;pendingSince=Date.now()/1000;controls();$('filesExecute').disabled=true;
-  $('filesError').hidden=true;$('filesResult').hidden=true;
-  try{await api('/api/files-start',{token:plan.token,confirmed:true});observed=true;plan=null;$('filesPlanDialog').close();}
-  catch(error){filesBusy=false;uiText($('filesError'),error.message);$('filesError').hidden=false;}
+  if(!plan||planning||filesBusy)return;starting=true;filesBusy=true;stopRequested=false;pendingSince=Date.now()/1000;controls();$('filesExecute').disabled=true;
+  $('filesStop').hidden=false;uiText($('filesStop'),msg('stop_remaining_deletions'));
+  $('filesResult').hidden=true;$('filesProgress').hidden=false;$('filesProgressBar').value=0;
+  uiText($('filesProgressText'),msg('files_starting'));uiText($('filesPlanTitle'),msg('files_running'));uiText($('filesPlanClose'),msg('close'));
+  try{await api('/api/files-start',{token:plan.token,confirmed:true});errors.clear('start');observed=true;plan=null;}
+  catch(error){filesBusy=false;$('filesProgress').hidden=true;$('filesStop').hidden=true;errors.show(error,'start');}
   finally{starting=false;$('filesExecute').disabled=false;controls();}
  };
- $('filesStop').onclick=async()=>{try{$('filesStop').disabled=true;await api('/api/files-stop',{});}catch(error){uiText($('filesError'),error.message);$('filesError').hidden=false;$('filesStop').disabled=false;}};
+ $('filesStop').onclick=async()=>{if(stopping||stopRequested)return;stopping=true;controls();try{await api('/api/files-stop',{});stopRequested=true;uiText($('filesStop'),msg('stopping'));errors.clear('stop');}catch(error){errors.show(error,'stop');}finally{stopping=false;controls();}};
  function finish(progress){
-  $('filesResult').replaceChildren();$('filesResult').hidden=false;
-  const failed=(progress.results||[]).filter(result=>result.status==='failed');
-  uiText($('filesResult'),msg(progress.error?'files_failed':progress.stopped?'files_stopped':'files_finished',{count:progress.done||0,size:fmt(progress.bytes),failed:failed.length}));
+  I18N.unbind($('filesResult'));$('filesResult').replaceChildren();$('filesResult').hidden=false;
+  const results=progress.results||[],count=status=>results.filter(result=>result.status===status).reduce((sum,result)=>sum+(result.files||1),0);
+  const failed=progress.failed??count('failed'),skipped=progress.skipped??count('skipped'),success=progress.success??count('success'),remaining=Math.max(0,(progress.total||0)-(progress.done||0));
+  $('filesResult').append(element('p',msg(progress.error?'files_failed_detail':progress.stopped?'files_stopped_detail':failed||skipped?'files_partial_detail':'files_finished_detail',{success,failed,skipped,remaining,size:fmt(progress.bytes)})));
   if(progress.error)$('filesResult').append(element('p',progress.error));
-  if(failed.length){const details=element('details');details.append(element('summary',msg('files_failures')));for(const result of failed)details.append(content('p',result.path+'\n'+result.error));$('filesResult').append(details);}
+  const groups=new Map();
+  for(const result of results.filter(result=>result.status==='failed'||result.status==='skipped')){
+   const key=result.status+'\n'+result.error;if(!groups.has(key))groups.set(key,{status:result.status,error:result.error,count:0,paths:[]});
+   const group=groups.get(key);group.count+=result.files||1;if(group.paths.length<5)group.paths.push(result.actual_path||result.path);
+  }
+  if(groups.size){const details=element('details');details.append(element('summary',msg('files_issues')));for(const group of groups.values()){
+   const item=element('div');item.append(element('p',msg(group.status==='skipped'?'files_skipped_group':'files_failed_group',{count:group.count})),element('p',group.error));for(const path of group.paths)item.append(content('p',path,'files-path'));details.append(item);
+  }$('filesResult').append(details);}
+  $('filesPlanList').hidden=true;$('filesPlanWarning').hidden=true;$('filesExecute').hidden=true;$('filesRetry').hidden=!(failed||skipped||remaining||progress.error);
+  uiText($('filesPlanTitle'),msg('files_result_title'));uiText($('filesPlanClose'),msg('close'));uiText($('filesPlanSummary'),msg('files_processed',{done:progress.done||0,total:progress.total||0}));openPlanDialog();
  }
  async function progress(){
   try{const next=await api('/api/files-progress');
-   if(next.running){observed=true;filesBusy=true;$('filesProgress').hidden=false;$('filesProgressBar').max=next.total||1;$('filesProgressBar').value=next.done;uiText($('filesProgressText'),msg('files_progress',{done:next.done,total:next.total,size:fmt(next.bytes)}));controls();}
-   else if(!next.running&&!starting&&(observed||pendingSince&&next.started>=pendingSince)){observed=false;pendingSince=0;filesBusy=false;$('filesProgress').hidden=true;$('filesStop').disabled=false;finish(next);await inspect();controls();}
+   if(next.running){
+    errors.clear('start');if(!observed)stopRequested=false;observed=true;filesBusy=true;
+    if(!$('filesPlanDialog').open){$('filesPlanList').replaceChildren();$('filesPlanWarning').hidden=true;uiText($('filesPlanSummary'),msg('files_reconnecting'));openPlanDialog();}
+    uiText($('filesPlanTitle'),msg('files_running'));uiText($('filesPlanClose'),msg('close'));
+    $('filesResult').hidden=true;$('filesRetry').hidden=true;$('filesPlanLoading').hidden=true;
+    plan=null;$('filesExecute').disabled=true;$('filesProgress').hidden=false;$('filesStop').hidden=false;
+    $('filesProgressBar').max=next.total||1;$('filesProgressBar').value=next.done;
+    uiText($('filesProgressText'),msg(next.phase==='checking'?'files_rechecking':'files_progress',{done:next.done,total:next.total,size:fmt(next.bytes)}));controls();
+   }
+   else if(!next.running&&!starting&&(observed||pendingSince&&next.started>=pendingSince)){errors.clear('start');errors.clear('stop');observed=false;pendingSince=0;filesBusy=false;$('filesProgress').hidden=true;$('filesStop').hidden=true;$('filesStop').disabled=false;finish(next);controls();await inspect();controls();}
   }catch{}finally{setTimeout(progress,1000);}
  }
  window.addEventListener('cleaner-tab-change',event=>{if(event.detail==='files'&&(!report||report.home!==state?.home))inspect();});

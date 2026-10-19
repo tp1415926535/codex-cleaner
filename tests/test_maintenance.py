@@ -90,4 +90,30 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         with database(self.home/'logs_2.sqlite') as c:
             self.assertEqual(c.execute('select count(*) from logs').fetchone()[0],2)
 
+    def test_space_requirement_is_disclosed_and_low_space_changes_nothing(self):
+        with patch('cleaner.maintenance.shutil.disk_usage', return_value=SimpleNamespace(free=1024)):
+            plan = self.service.plan(['logs_2.sqlite'], 0)
+            entry = plan['entries'][0]
+            self.assertGreaterEqual(entry['required_temp_bytes'], 16 * 1024 * 1024)
+            self.assertEqual(entry['available_bytes'], 1024)
+            self.assertEqual(entry['shortfall_bytes'], entry['required_temp_bytes'] - 1024)
+            result = self.run_plan(plan)[0]
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['deleted_logs'], 0)
+        self.assertEqual(result['released'], 0)
+        self.assertIn('临时磁盘空间不足', result['error'])
+        self.assertIn('还差', result['error'])
+        with database(self.home/'logs_2.sqlite') as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM logs').fetchone()[0], 2)
+
+    def test_space_is_rechecked_at_execution(self):
+        plan = self.service.plan(['thread_history_1.sqlite'])
+        with patch('cleaner.maintenance.shutil.disk_usage', return_value=SimpleNamespace(free=0)):
+            result = self.run_plan(plan)[0]
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['available_bytes'], 0)
+        self.assertEqual(result['shortfall_bytes'], result['required_temp_bytes'])
+        with database(self.home/'thread_history_1.sqlite') as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM thread_items').fetchone()[0], 2)
+
 if __name__=='__main__': unittest.main()

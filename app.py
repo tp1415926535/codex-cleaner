@@ -17,6 +17,9 @@ from urllib.parse import parse_qs, urlsplit
 from cleaner.core import Store
 
 ROOT = Path(__file__).resolve().parent
+REQUEST_LIMIT = 32 * 1024
+# Plans carry the full selection (UUIDs or paths), unlike small control requests.
+PLAN_REQUEST_LIMIT = 16 * 1024 * 1024
 
 
 def make_server(store, port=8765):
@@ -109,7 +112,10 @@ def make_server(store, port=8765):
                 return self.reply({'error': '本地来源或 CSRF 校验失败，请从工具页面操作'}, 403)
             try:
                 length = int(self.headers.get('Content-Length', '0'))
-                if length < 0 or length > 32768: raise ValueError('请求过大')
+                if length < 0: raise ValueError('请求过大')
+                limit = PLAN_REQUEST_LIMIT if self.path in ('/api/plan', '/api/files-plan') else REQUEST_LIMIT
+                if length > limit:
+                    return self.reply({'error': f'请求超过 {limit // 1024} KiB 上限，请减少选择项后重试'}, 413)
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json': raise ValueError('仅支持 JSON 请求')
                 data = json.loads(self.rfile.read(length))
                 if self.path == '/api/files-reveal':

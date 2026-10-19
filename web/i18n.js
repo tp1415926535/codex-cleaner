@@ -45,8 +45,10 @@ const I18N=(()=>{
  }
  document.getElementById('language').value=language;
  document.getElementById('language').onchange=e=>setLanguage(e.target.value);
- const ready=Promise.all(supported.map(async lang=>{const response=await fetch('/locales/'+lang+'.json');if(!response.ok)throw new Error('Language resources could not be loaded');return [lang,await response.json()];})).then(entries=>{
+ const ready=(async()=>{while(true){try{
+  const entries=await Promise.all(supported.map(async lang=>{const response=await fetch('/locales/'+lang+'.json');if(!response.ok)throw new Error('Language resources could not be loaded');return [lang,await response.json()];}));
   catalogs=Object.fromEntries(entries);
+  patterns=[];exact.clear();
   for(const [key,template] of Object.entries(catalogs['zh-CN'])){
    if(['list_sessions','list_internal'].includes(key))continue;
    if(!template.includes('{')){exact.set(template,key);continue;}
@@ -58,7 +60,8 @@ const I18N=(()=>{
   }
   patterns.sort((a,b)=>b.specificity-a.specificity);
   initStatic();apply();
- }).catch(()=>{document.getElementById('language').disabled=true;document.getElementById('language').title='Language resources unavailable / 语言资源加载失败';});
+  document.getElementById('language').disabled=false;document.getElementById('language').removeAttribute('title');return;
+ }catch{document.getElementById('language').disabled=true;document.getElementById('language').title='Language resources unavailable / 语言资源加载失败';await new Promise(resolve=>setTimeout(resolve,2000));}}})();
  return {message,format,text,raw,attribute,sourceText,unbind:node=>textBindings.delete(node),setLanguage,ready,get language(){return language;}};
 })();
 const uiText=(node,value)=>I18N.text(node,value);
